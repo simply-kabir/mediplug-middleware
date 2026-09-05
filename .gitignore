@@ -1,4 +1,6 @@
 .env
+.env.bak
+.DS_Store
 data/raw/
 data/interim/
 .venv/
