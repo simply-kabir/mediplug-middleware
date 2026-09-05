@@ -1,0 +1,9 @@
+.env
+data/raw/
+data/interim/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+data/package_embeddings.npy
