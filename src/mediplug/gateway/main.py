@@ -63,7 +63,17 @@ async def lifespan(app: FastAPI):
         await db_pool.close()
 
 
+from fastapi.middleware.cors import CORSMiddleware
+
 app = FastAPI(title="MediPlug Gateway", version="0.2.0", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def _new_tracking_ref() -> str:

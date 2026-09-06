@@ -82,5 +82,33 @@ canonical data file directly.
 ---
 
 ## Log
+## 6. Database Webhook instead of polling sync script
+
+Current HMS-sync approach (Step 5 of the integration plan) polls his
+Supabase project every few seconds and POSTs new rows to the gateway.
+Works, simple to debug, but not truly event-driven.
+
+**Upgrade path if there's time near the end:** use Supabase Database
+Webhooks (built on `pg_net`) on his HMS project — a trigger fires
+immediately on `INSERT` to the patient/case table and POSTs straight to
+the gateway, no polling delay.
+
+**Why this was skipped for the initial build, not just "not gotten to
+yet":** webhooks fire from Supabase's own servers on the public internet.
+If the gateway is running locally during dev, Supabase literally can't
+reach it — needs a persistent public tunnel (ngrok/Cloudflare Tunnel)
+running the whole time, one more thing to keep alive through dev and
+demo day. Polling avoids that entirely since it's a script you run and
+control yourself.
+
+**Worth it if:** the gateway ends up deployed somewhere with a real public
+URL anyway (not just localhost) by demo time — then the tunnel problem
+disappears and this becomes close to free. Also a genuinely good pitch
+line either way: "the sync path can be either near-real-time polling or
+fully event-driven via webhook, same mapping logic underneath."
+
+**Effort:** low once the gateway has a stable public URL — mostly just
+wiring the webhook in Supabase's dashboard and confirming the payload
+shape from `pg_net` maps the same way the polling script already does.
 
 *(Add any new stretch ideas here as they come up, most recent last.)*

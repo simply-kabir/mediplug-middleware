@@ -10,7 +10,7 @@ with everyone downstream.
 from __future__ import annotations
 
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from enum import StrEnum
 from typing import Literal
 
@@ -56,7 +56,7 @@ class JobEnvelope(BaseModel):
     case_id: str
     attempt: int = 1
     stage: Stage
-    enqueued_at: datetime = Field(default_factory=datetime.utcnow)
+    enqueued_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     trigger: Trigger = "ingest"
 
 

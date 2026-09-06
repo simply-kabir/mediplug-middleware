@@ -1,0 +1,40 @@
+import type { Metadata } from "next";
+import "./globals.css";
+
+export const metadata: Metadata = {
+  title: "MediPlug — Aarogyamitra Portal",
+  description: "Real-time MJPJAY Pre-Auth & Claims Middleware Portal",
+};
+
+export default function RootLayout({
+  children,
+}: Readonly<{
+  children: React.ReactNode;
+}>) {
+  return (
+    <html lang="en">
+      <head>
+        <link rel="preconnect" href="https://fonts.googleapis.com" />
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="anonymous" />
+        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+        <script src="https://cdn.tailwindcss.com"></script>
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `
+              tailwind.config = {
+                theme: {
+                  extend: {
+                    fontFamily: {
+                      sans: ['Inter', 'sans-serif'],
+                    },
+                  }
+                }
+              }
+            `,
+          }}
+        />
+      </head>
+      <body className="antialiased min-h-screen bg-slate-100 font-sans">{children}</body>
+    </html>
+  );
+}

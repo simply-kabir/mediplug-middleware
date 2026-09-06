@@ -36,16 +36,18 @@ Phase 2 — Database schema                    ✅ DONE
 Phase 3 — Ingest gateway                     ✅ DONE
 Phase 4 — Worker skeleton (walking skeleton) ✅ DONE
 Phase 5 — Semantic code mapping              ✅ DONE
-Phase 6 — Pre-flight rule engine             ⏳ NEXT (the entire project)
+Phase 6 — Pre-flight rule engine             ⏳ NEXT (Day 4 target — the entire project)
 Phase 7 — FHIR R4 bundle builder
 Phase 8 — Dispatch (both NHCX scenarios)
 Phase 9 — Resilience and observability
 Phase 10 — Demo script and failure drills
 ```
 
-Phase 3+4 together were the **Day 2** target. Exit criteria met:
-**walking skeleton — POST → worker processes → Supabase row updates live,
-nothing intelligent yet.**
+**Milestone status against Master Build Guide (Appendix C):**
+- **Day 1 Exit Criteria MET:** Package master data loaded (1,670 rows, 0.4% unmapped), schema live in Supabase.
+- **Day 2 Exit Criteria MET:** Walking skeleton live — POST → gateway → Redis → worker → Supabase Realtime updates.
+- **Day 3 Exit Criteria MET:** Semantic mapping + abbreviations + vector search + confidence routing (`>=0.82` auto-accept, `0.45-0.82` human review, `<0.45` action required) + `POST /confirm-code` human-in-the-loop endpoint + Next.js Aarogyamitra portal connected to Supabase Realtime.
+- **Day 4 Target (UP NEXT):** Phase 6 — Pre-flight rule engine (`action_required` for missing documents, `POST /cases/{id}/documents` re-enqueue flow).
 
 ---
 
@@ -358,3 +360,42 @@ of the sync script never double-ingest the same encounter.
     re-enqueued job with `trigger="code_confirmed"` and promotes to `ready_for_dispatch`.
   - Branch 3: Low confidence (0.331) -> correctly routed to `action_required` without writing code.
   - All tests passed 100% locally. Code is verified and kept local (not pushed yet).
+
+### Session: 2026-09-06 (cont.) — Full Guide Audit & Automated Test Suite Verification (Phases 0–5)
+
+**Comprehensive Audit against Master Build Guide (`MEDIPLUG_MIDDLEWARE_BUILD_GUIDE.md`):**
+
+- **Phase 0 (Contracts):** `schemas.py` fully verified. Contains all 11 `CaseStatus` enum states, `JobEnvelope`, `IngestRequest`, `IngestResponse`, `Requirement`, `RequirementOption`, `CodeCandidate`, `ConfirmCodeRequest`. Modernized `JobEnvelope.enqueued_at` to use `datetime.now(timezone.utc)` instead of deprecated `datetime.utcnow()`.
+- **Phase 1 (Package Master Pipeline):** 1,670 packages loaded in Supabase `packages` master table (0 duplicate codes, 0 missing names, 0.39% unmapped doc refs via rapidfuzz fallback, easily passing the `< 5%` QA gate).
+- **Phase 2 (Database Schema):** `schema.sql` and `rls.sql` verified on Supabase. Table structures (`packages`, `cases`, `case_documents`, `case_events`), constraints (unique `tracking_ref`, unique `idempotency_key`), auto-updating timestamps, and Supabase Realtime publication confirmed active.
+- **Phase 3 (Ingest Gateway):** `src/mediplug/gateway/main.py` + `queue.py` verified. Idempotency replay and race-condition handling (`UniqueViolation` retry), Postgres insertion, Redis Streams `XADD`, `GET /health`, and FastAPI `CORSMiddleware` (for frontend Aarogyamitra UI access) fully functional.
+- **Phase 4 (Worker Engine):** `src/mediplug/worker/consumer.py` verified. `XREADGROUP` consumer loop with block timeout, unique `CONSUMER_NAME`, `XACK` on every exit branch (success, retry, DLQ), exponential backoff, dead-lettering to `mediplug:cases:dlq`, and background `XAUTOCLAIM` for crashed workers.
+- **Phase 5 (Semantic Code Mapping & Human Confirmation Flow):**
+  - Embedding matrix pre-computed at `data/cache/package_embeddings.npy` (1,670 packages, dim=384, fingerprint verified).
+  - 3-layer architecture: abbreviation expansion -> rapidfuzz lexical prefilter -> sentence-transformers semantic reranking.
+  - Confidence routing: $\ge 0.82 \implies$ auto-accept, $0.45 - 0.82 \implies$ `needs_code_confirmation` (stores alternates, keeps code `NULL`), $< 0.45 \implies$ `action_required`.
+  - Human confirmation endpoint `POST /api/v1/cases/{case_id}/confirm-code` updates case, logs audit event, and re-enqueues with `trigger="code_confirmed"`.
+  - Worker pipeline skips re-mapping on confirmed cases.
+- **HMS Sync Bridge (Integration):** Diff-based polling module safely ingesting 50 real encounters (`ENC-2026-1001` to `ENC-2026-1050`) from teammate's independent Mock HMS database without modifying his schema.
+- **Frontend Portal (Aarogyamitra UI):** Next.js 16 + Tailwind CSS portal in `frontend/` subscribed to Supabase Realtime WebSocket changes, live status badges, metric counters, search/filter, and interactive modal connected to `POST /confirm-code`.
+
+**Accuracy Evaluation Harness (`scripts/07_mapping_eval.py`):**
+- Ran 28 benchmark clinical note fixtures:
+  - Top-1 Accuracy: **27/28 (96.4%)**
+  - Top-3 Accuracy: **27/28 (96.4%)**
+  - Dangerous wrong-code auto-accepts: **0**
+  - Wasted correct-but-rejected matches: **0**
+  - Confirmed 0.82 auto-accept / 0.45 floor thresholds are safe and effective.
+
+**Automated Unit Tests (`tests/`):**
+- Built clean pytest suites in `tests/`:
+  - `tests/test_contracts.py`: Validates all 11 statuses, envelope defaults, and schemas.
+  - `tests/test_normalize.py`: Validates abbreviation expansion (`expand()`), taxonomy mapping (`canonicalize()`), and requirement string parser.
+  - `tests/test_mapper.py`: Validates corpus loading, sorted code order, and semantic mapping.
+- Executed `pytest tests/`: **11 passed, 0 failures, 0 warnings** in 26.33s.
+
+**Phase 6 Readiness Assessment (Next Day 4 Target):**
+- Phase 6 requires the Pre-flight Rule Engine (`src/mediplug/rules/engine.py`), comparing `packages.requirements[stage]` with `case_documents`.
+- If missing docs $\implies$ route to `action_required` with `missing_requirements` array.
+- Implement `POST /api/v1/cases/{case_id}/documents` to re-enqueue on document upload with `trigger="docs_updated"`.
+- Everything in Phases 0 through 5 is 100% complete, tested, and ready for Phase 6.
