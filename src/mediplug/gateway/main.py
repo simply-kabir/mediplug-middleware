@@ -13,8 +13,13 @@ Run it:
 from __future__ import annotations
 
 import secrets
+import sys
 import uuid
 from contextlib import asynccontextmanager
+import asyncio
+
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 import psycopg
 import structlog

@@ -18,6 +18,10 @@ class Settings(BaseSettings):
     supabase_url: str | None = None
     supabase_service_key: str | None = None
 
+    # --- Teammate's HMS Supabase (separate project, read-only) ---
+    hms_supabase_url: str = ""
+    hms_supabase_key: str = ""
+
     embedding_backend: str = "local"
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     embedding_api_key: str | None = None
