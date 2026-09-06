@@ -399,3 +399,7 @@ of the sync script never double-ingest the same encounter.
 - If missing docs $\implies$ route to `action_required` with `missing_requirements` array.
 - Implement `POST /api/v1/cases/{case_id}/documents` to re-enqueue on document upload with `trigger="docs_updated"`.
 - Everything in Phases 0 through 5 is 100% complete, tested, and ready for Phase 6.
+- **Git State:** Commit `aaa63ca` pushed to `origin/main`. Working tree clean.
+- **Demo Cases Ingested & Verified:**
+  - `Arun K. Sharma` (`MP-15D7E030DA`): Vague cold/cough -> confidence `0.402` -> `action_required`.
+  - `Kavita R. Shinde` (`MP-272F78C5EF`): Lap chole -> confidence `0.598` -> `needs_code_confirmation` with 3 candidates.
