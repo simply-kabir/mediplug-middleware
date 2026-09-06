@@ -1,10 +1,9 @@
-"""Ingest gateway — Phase 3.
+"""Ingest gateway — Phase 3 + Phase 5 confirm-code.
 
-POST /api/v1/cases/ingest is the only thing the HMS talks to, and it does
-exactly four things: validate, insert into Postgres, XADD to Redis, respond.
-No code mapping, no rule checking, no dispatch — that's the worker's job
-(Phase 4+). Keep this file thin — IngestResponse promises callers <50ms,
-which only holds if nothing "smart" happens in here.
+POST /api/v1/cases/ingest and POST /api/v1/cases/{case_id}/confirm-code are
+the only things this file exposes. Both do the minimum: validate, write to
+Postgres, XADD to Redis, respond. No mapping, no rule checking, no dispatch
+— that's the worker's job.
 
 Run it:
     uv run uvicorn mediplug.gateway.main:app --reload --port 8000
@@ -13,13 +12,8 @@ Run it:
 from __future__ import annotations
 
 import secrets
-import sys
 import uuid
 from contextlib import asynccontextmanager
-import asyncio
-
-if sys.platform == "win32":
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 import psycopg
 import structlog
@@ -30,19 +24,25 @@ from psycopg_pool import AsyncConnectionPool
 from ..config import settings
 from ..logging import configure
 from ..queue import enqueue, ensure_group
-from ..schemas import CaseStatus, IngestRequest, IngestResponse, JobEnvelope
+from ..schemas import (
+    CaseStatus,
+    ConfirmCodeRequest,
+    IngestRequest,
+    IngestResponse,
+    JobEnvelope,
+)
 
 configure()
 log = structlog.get_logger()
 
 # A real pool, not one connection per request. A single blocking
 # psycopg.connect() call inside an async route stalls the whole event loop
-# for the DB round-trip — under concurrent load, requests queue up behind
-# each other instead of running concurrently, which breaks the <50ms
-# promise in IngestResponse's docstring. min_size/max_size stay comfortably
-# under Supabase's session-pooler client cap. Opened/closed via the
-# lifespan below, not at import time, so tests can import this module
-# without a live DB.
+# for the DB round-trip — under concurrent load (ingest AND confirm-code
+# calls can both be in flight at once), requests queue up behind each other
+# instead of running concurrently. min_size/max_size stay comfortably under
+# Supabase's session-pooler client cap. Opened/closed via the lifespan
+# below, not at import time, so tests can import this module without a
+# live DB.
 db_pool = AsyncConnectionPool(
     settings.database_url,
     min_size=2,
@@ -63,14 +63,12 @@ async def lifespan(app: FastAPI):
         await db_pool.close()
 
 
-app = FastAPI(title="MediPlug Ingest Gateway", lifespan=lifespan)
+app = FastAPI(title="MediPlug Gateway", version="0.2.0", lifespan=lifespan)
 
 
 def _new_tracking_ref() -> str:
     """Human-readable-ish ref for the HMS side to display/search on. Not the
-    primary key — cases.id is. A collision is astronomically unlikely at
-    hackathon scale, and the unique constraint on the column would surface
-    one anyway."""
+    primary key — cases.id is."""
     return f"MP-{secrets.token_hex(5).upper()}"
 
 
@@ -86,6 +84,10 @@ async def _get_by_idempotency_key(cur, idempotency_key: str):
 async def health() -> dict:
     return {"status": "ok"}
 
+
+# ---------------------------------------------------------------------------
+# Ingest
+# ---------------------------------------------------------------------------
 
 @app.post("/api/v1/cases/ingest", response_model=IngestResponse, status_code=202)
 async def ingest(
@@ -141,8 +143,7 @@ async def ingest(
                     # Two requests with the same Idempotency-Key raced past
                     # the check above — whoever lost the insert just reads
                     # back what the winner wrote, instead of erroring the
-                    # caller. This ONLY works because idempotency_key has a
-                    # UNIQUE constraint in schema.sql — confirm that's there.
+                    # caller. Requires idempotency_key UNIQUE in schema.sql.
                     await conn.rollback()
                     async with conn.cursor() as retry_cur:
                         existing = await _get_by_idempotency_key(
@@ -187,15 +188,10 @@ async def ingest(
         log.error("db_error_on_ingest", error=str(exc))
         raise HTTPException(500, "Database error during ingest") from exc
 
-    # Deliberately thin payload — the worker re-reads the full case from
-    # Postgres, so this call never blocks on anything but the DB write above.
     envelope = JobEnvelope(case_id=str(case_id), stage=body.stage, trigger="ingest")
     try:
         job_id = await enqueue(envelope)
     except Exception as exc:
-        # The case row is already committed — it'll sit as 'queued' until
-        # someone re-enqueues it. Log loudly but don't fail the HTTP
-        # response, because the data is safe in Postgres.
         log.error("redis_enqueue_failed", case_id=str(case_id), error=str(exc))
         job_id = None
 
@@ -209,3 +205,106 @@ async def ingest(
     return IngestResponse(
         case_id=str(case_id), status=CaseStatus.QUEUED, tracking_ref=tracking_ref
     )
+
+
+# ---------------------------------------------------------------------------
+# Confirm code (human-in-the-loop, Phase 5)
+# ---------------------------------------------------------------------------
+
+@app.post("/api/v1/cases/{case_id}/confirm-code", status_code=200)
+async def confirm_code(case_id: uuid.UUID, body: ConfirmCodeRequest) -> dict:
+    """Aarogyamitra confirms or manually selects a package code. Validates
+    the code exists in `packages` (prevents an FK violation), updates the
+    case, writes an audit event, and re-enqueues with
+    trigger='code_confirmed' so the worker promotes it without re-mapping."""
+    case_str = str(case_id)
+
+    try:
+        async with db_pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "select name from packages where code = %s", (body.code,)
+                )
+                pkg_row = await cur.fetchone()
+                if not pkg_row:
+                    raise HTTPException(
+                        400,
+                        f"Package code '{body.code}' not found in packages master",
+                    )
+                package_name = pkg_row[0]
+
+                await cur.execute(
+                    "select status, stage, tracking_ref from cases where id = %s",
+                    (case_str,),
+                )
+                case_row = await cur.fetchone()
+                if not case_row:
+                    raise HTTPException(404, "Case not found")
+                prev_status, stage, tracking_ref = case_row
+
+                await cur.execute(
+                    """
+                    update cases
+                    set mapped_package_code = %s,
+                        mapped_package_name = %s,
+                        code_confirmed_by = %s,
+                        code_confirmed_at = now(),
+                        status = %s
+                    where id = %s
+                    """,
+                    (
+                        body.code,
+                        package_name,
+                        body.confirmed_by,
+                        CaseStatus.QUEUED.value,
+                        case_str,
+                    ),
+                )
+
+                await cur.execute(
+                    """
+                    insert into case_events
+                        (case_id, from_status, to_status, actor, detail)
+                    values (%s, %s, %s, 'aarogyamitra', %s)
+                    """,
+                    (
+                        case_str,
+                        prev_status,
+                        CaseStatus.QUEUED.value,
+                        Json(
+                            {
+                                "confirmed_code": body.code,
+                                "confirmed_by": body.confirmed_by,
+                            }
+                        ),
+                    ),
+                )
+            await conn.commit()
+    except HTTPException:
+        raise
+    except psycopg.Error as exc:
+        log.error("db_error_on_confirm_code", case_id=case_str, error=str(exc))
+        raise HTTPException(500, "Database error during code confirmation") from exc
+
+    envelope = JobEnvelope(case_id=case_str, stage=stage, trigger="code_confirmed")
+    try:
+        job_id = await enqueue(envelope)
+    except Exception as exc:
+        log.error("redis_enqueue_failed_on_confirm", case_id=case_str, error=str(exc))
+        job_id = None
+
+    log.info(
+        "code_confirmed",
+        case_id=case_str,
+        code=body.code,
+        confirmed_by=body.confirmed_by,
+        job_id=job_id,
+    )
+
+    return {
+        "case_id": case_str,
+        "tracking_ref": tracking_ref,
+        "status": CaseStatus.QUEUED.value,
+        "mapped_package_code": body.code,
+        "mapped_package_name": package_name,
+    }

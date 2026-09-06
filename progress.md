@@ -35,8 +35,8 @@ Phase 1 — Package master data pipeline       ✅ DONE
 Phase 2 — Database schema                    ✅ DONE
 Phase 3 — Ingest gateway                     ✅ DONE
 Phase 4 — Worker skeleton (walking skeleton) ✅ DONE
-Phase 5 — Semantic code mapping              ⏳ NEXT
-Phase 6 — Pre-flight rule engine             ← guide calls this "the entire project," never cut
+Phase 5 — Semantic code mapping              ✅ DONE
+Phase 6 — Pre-flight rule engine             ⏳ NEXT (the entire project)
 Phase 7 — FHIR R4 bundle builder
 Phase 8 — Dispatch (both NHCX scenarios)
 Phase 9 — Resilience and observability
@@ -176,10 +176,9 @@ Unmapped doc refs:            0.4%  (gate: <5% ✅)
 
 ## Not yet built
 
-- Semantic/AI code mapping (clinical notes → package code)
-- Pre-flight rule engine (the demo "wow" feature)
-- FHIR R4 bundle builder
-- Dispatch (mock payer + NHCX sandbox)
+- Pre-flight rule engine (the demo "wow" feature) — Phase 6
+- FHIR R4 bundle builder — Phase 7
+- Dispatch (mock payer + NHCX sandbox) — Phase 8
 - Document upload re-enqueue endpoint (`POST /cases/{id}/documents`)
 
 ---
@@ -316,3 +315,46 @@ against our `cases.hms_case_ref` to find what's new.
 
 **Idempotency:** deterministic key per encounter_id via `uuid5` — reruns
 of the sync script never double-ingest the same encounter.
+
+### Session: 2026-09-06 — Phase 5 (Semantic Code Mapping & Confirm-Code Flow)
+
+**Work split (per `PHASE5_SPLIT.md`):**
+- Part A (Shubh, Mac): `CodeCandidate` schema, `corpus.py` (ORDER BY code),
+  `abbreviations.py`, `embeddings_cache.py`, `mapper.py` (two-layer: rapidfuzz
+  prefilter + sentence-transformers rerank), `06_build_embeddings.py`,
+  `07_mapping_eval.py`.
+- Part B (Kabir): `ConfirmCodeRequest` schema, `pipeline.py` rewrite with
+  confidence routing & `to_thread`, `gateway/main.py` confirm-code endpoint.
+
+**What was built & verified:**
+- Embedding cache pre-computed locally via `scripts/06_build_embeddings.py`:
+  1,670 packages encoded (dim=384) in `data/cache/package_embeddings.npy`
+  with sha256 fingerprint.
+- `src/mediplug/schemas.py`: Added `ConfirmCodeRequest(code, confirmed_by)`.
+- `src/mediplug/worker/pipeline.py`: Replaced dumb timer with real AI mapping
+  via `asyncio.to_thread(map_notes, notes, 3)`.
+  - $\ge 0.82 \implies$ `ready_for_dispatch` (writes code, name, confidence, alternates).
+  - $0.45 - 0.82 \implies$ `needs_code_confirmation` (writes alternates + confidence, leaves code NULL).
+  - $< 0.45 \implies$ `action_required`.
+  - Wrapped `alternate_codes` with `psycopg.types.json.Json()` to fix jsonb serialization.
+  - Suppressed duplicate audit rows if status unchanged on retries.
+- `src/mediplug/gateway/main.py`: Added `POST /api/v1/cases/{case_id}/confirm-code`.
+  Validates code against `packages` table, updates case, inserts audit event
+  (`actor='aarogyamitra'`), and re-enqueues with `trigger='code_confirmed'`.
+- Pipeline skips re-mapping on `trigger == "code_confirmed"` if code is set,
+  directly promoting to `ready_for_dispatch`.
+
+**End-to-End Verification:**
+- Worker processed the live backlog of 50 hospital cases from HMS:
+  12 auto-accepted (`ready_for_dispatch`), 9 required human confirmation
+  (`needs_code_confirmation`), 5 required action (`action_required`).
+- Tested `POST /confirm-code` on case `e7e4a80a-...`: Aarogyamitra confirmed
+  code `S9H5.1`, worker picked up the re-enqueued job, and promoted it to
+  `ready_for_dispatch` without re-mapping.
+- Comprehensive 4-branch local test suite (`test_phase5_verified.py`) executed:
+  - Branch 1: Borderline confidence (0.523) -> correctly routed to `needs_code_confirmation`,
+    leaves `mapped_package_code` as NULL, saves 3 alternate candidates.
+  - Branch 2: Aarogyamitra confirms code via `POST /confirm-code` -> worker picks up
+    re-enqueued job with `trigger="code_confirmed"` and promotes to `ready_for_dispatch`.
+  - Branch 3: Low confidence (0.331) -> correctly routed to `action_required` without writing code.
+  - All tests passed 100% locally. Code is verified and kept local (not pushed yet).

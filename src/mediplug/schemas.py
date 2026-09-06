@@ -137,3 +137,11 @@ class CodeCandidate(BaseModel):
                         # violates the FK.
     name: str
     confidence: float  # 0.0 - 1.0
+
+
+class ConfirmCodeRequest(BaseModel):
+    """Payload for POST /api/v1/cases/{case_id}/confirm-code."""
+
+    code: str
+    confirmed_by: str = "aarogyamitra"
+
