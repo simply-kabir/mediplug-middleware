@@ -122,3 +122,18 @@ class Requirement(BaseModel):
     satisfied: bool
     any_of: list[RequirementOption]
     human_label: str
+
+
+# ---------------------------------------------------------------------------
+# 2.5 Semantic code mapping (Phase 5) — locked interface, see
+#     sih/PHASE5_SPLIT.md §1. mapper.py produces these; worker/pipeline.py
+#     consumes them for confidence routing.
+# ---------------------------------------------------------------------------
+
+
+class CodeCandidate(BaseModel):
+    code: str          # packages.code — always sourced from the DB, so
+                        # writing it to cases.mapped_package_code never
+                        # violates the FK.
+    name: str
+    confidence: float  # 0.0 - 1.0
