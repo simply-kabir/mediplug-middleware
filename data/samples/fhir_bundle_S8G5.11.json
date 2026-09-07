@@ -1,0 +1,199 @@
+{
+  "resourceType": "Bundle",
+  "id": "5d9887c6-25d7-4144-b834-0addeb13b7de",
+  "type": "collection",
+  "timestamp": "2026-09-07T09:57:51.786885+00:00",
+  "entry": [
+    {
+      "fullUrl": "urn:uuid:f878a454-6e29-42b7-9eef-598c91d8f543",
+      "resource": {
+        "resourceType": "Claim",
+        "id": "f878a454-6e29-42b7-9eef-598c91d8f543",
+        "status": "active",
+        "type": {
+          "coding": [
+            {
+              "system": "http://terminology.hl7.org/CodeSystem/claim-type",
+              "code": "institutional"
+            }
+          ]
+        },
+        "use": "preauthorization",
+        "patient": {
+          "reference": "urn:uuid:69d25838-92b8-4587-b2f4-c69e4c624a34"
+        },
+        "created": "2026-09-07T09:57:51.786885+00:00",
+        "insurer": {
+          "reference": "urn:uuid:c4343eee-8b50-4c01-9ecd-21b99265b178"
+        },
+        "provider": {
+          "reference": "urn:uuid:cfbe9510-bdb5-4a10-bed1-3369534be8fa"
+        },
+        "priority": {
+          "coding": [
+            {
+              "system": "http://terminology.hl7.org/CodeSystem/processpriority",
+              "code": "normal"
+            }
+          ]
+        },
+        "careTeam": [
+          {
+            "sequence": 1,
+            "provider": {
+              "reference": "urn:uuid:cc119454-5e61-4047-b37c-73007d92b911"
+            }
+          }
+        ],
+        "supportingInfo": [
+          {
+            "sequence": 1,
+            "category": {
+              "text": "attachment"
+            },
+            "valueReference": {
+              "reference": "urn:uuid:c9d2d21d-e0a8-4270-bfdc-01b7d34fbeb6"
+            }
+          }
+        ],
+        "insurance": [
+          {
+            "sequence": 1,
+            "focal": true,
+            "coverage": {
+              "reference": "urn:uuid:b93f1dc4-bbcb-4e0e-adaf-0982dc80b2c8"
+            }
+          }
+        ],
+        "item": [
+          {
+            "sequence": 1,
+            "productOrService": {
+              "coding": [
+                {
+                  "system": "https://www.jeevandayee.gov.in/package-code",
+                  "code": "S8G5.11",
+                  "display": "Laparoscopic Choleycystectomy"
+                }
+              ]
+            },
+            "unitPrice": {
+              "value": 40000,
+              "currency": "INR"
+            }
+          }
+        ],
+        "total": {
+          "value": 40000,
+          "currency": "INR"
+        },
+        "diagnosis": [
+          {
+            "sequence": 1,
+            "diagnosisCodeableConcept": {
+              "coding": [
+                {
+                  "system": "http://hl7.org/fhir/sid/icd-10",
+                  "code": "K77"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:69d25838-92b8-4587-b2f4-c69e4c624a34",
+      "resource": {
+        "resourceType": "Patient",
+        "id": "69d25838-92b8-4587-b2f4-c69e4c624a34",
+        "name": [
+          {
+            "text": "Kavita R. Shinde"
+          }
+        ],
+        "gender": "female",
+        "birthDate": "1987-05-14"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:cfbe9510-bdb5-4a10-bed1-3369534be8fa",
+      "resource": {
+        "resourceType": "Organization",
+        "id": "cfbe9510-bdb5-4a10-bed1-3369534be8fa",
+        "identifier": [
+          {
+            "system": "https://facility.abdm.gov.in",
+            "value": "HOSP-PUNE-01"
+          }
+        ],
+        "name": "Demo District Hospital"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:c4343eee-8b50-4c01-9ecd-21b99265b178",
+      "resource": {
+        "resourceType": "Organization",
+        "id": "c4343eee-8b50-4c01-9ecd-21b99265b178",
+        "name": "State Health Assurance Society (MJPJAY)"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:cc119454-5e61-4047-b37c-73007d92b911",
+      "resource": {
+        "resourceType": "Practitioner",
+        "id": "cc119454-5e61-4047-b37c-73007d92b911",
+        "identifier": [
+          {
+            "system": "https://hpr.abdm.gov.in",
+            "value": "MMC-2014-99881"
+          }
+        ],
+        "name": [
+          {
+            "text": "Dr. S. Kulkarni"
+          }
+        ]
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:b93f1dc4-bbcb-4e0e-adaf-0982dc80b2c8",
+      "resource": {
+        "resourceType": "Coverage",
+        "id": "b93f1dc4-bbcb-4e0e-adaf-0982dc80b2c8",
+        "status": "active",
+        "beneficiary": {
+          "reference": "urn:uuid:69d25838-92b8-4587-b2f4-c69e4c624a34"
+        },
+        "payor": [
+          {
+            "reference": "urn:uuid:c4343eee-8b50-4c01-9ecd-21b99265b178"
+          }
+        ],
+        "subscriberId": "UNKNOWN"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:c9d2d21d-e0a8-4270-bfdc-01b7d34fbeb6",
+      "resource": {
+        "resourceType": "DocumentReference",
+        "id": "c9d2d21d-e0a8-4270-bfdc-01b7d34fbeb6",
+        "status": "current",
+        "type": {
+          "text": "clinical_summary"
+        },
+        "subject": {
+          "reference": "urn:uuid:69d25838-92b8-4587-b2f4-c69e4c624a34"
+        },
+        "content": [
+          {
+            "attachment": {
+              "url": "https://storage.hospital.org/claims/summary.pdf",
+              "title": "clinical_summary"
+            }
+          }
+        ]
+      }
+    }
+  ]
+}
