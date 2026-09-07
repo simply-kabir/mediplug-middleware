@@ -394,12 +394,14 @@ of the sync script never double-ingest the same encounter.
   - `tests/test_mapper.py`: Validates corpus loading, sorted code order, and semantic mapping.
 - Executed `pytest tests/`: **11 passed, 0 failures, 0 warnings** in 26.33s.
 
-**Phase 6 Readiness Assessment (Next Day 4 Target):**
-- Phase 6 requires the Pre-flight Rule Engine (`src/mediplug/rules/engine.py`), comparing `packages.requirements[stage]` with `case_documents`.
-- If missing docs $\implies$ route to `action_required` with `missing_requirements` array.
-- Implement `POST /api/v1/cases/{case_id}/documents` to re-enqueue on document upload with `trigger="docs_updated"`.
-- Everything in Phases 0 through 5 is 100% complete, tested, and ready for Phase 6.
-- **Git State:** Commit `aaa63ca` pushed to `origin/main`. Working tree clean.
-- **Demo Cases Ingested & Verified:**
-  - `Arun K. Sharma` (`MP-15D7E030DA`): Vague cold/cough -> confidence `0.402` -> `action_required`.
-  - `Kavita R. Shinde` (`MP-272F78C5EF`): Lap chole -> confidence `0.598` -> `needs_code_confirmation` with 3 candidates.
+- **Phase 6: Pre-flight Rule Engine (COMPLETED & VERIFIED):**
+  - Implemented pure functional `evaluate()` in `src/mediplug/rules/engine.py` with delimiter/case-insensitive normalization (`'USG_Abdomen'` <-> `'usg_abdomen'`). Zero external dependencies.
+  - Added unit test suite in `tests/test_rules.py` covering all 5 criteria (all satisfied, partial unsatisfied, zero-requirement packages, fuzzy normalization, plain strings).
+  - Wired rule checking into `src/mediplug/worker/pipeline.py` for both auto-accept mapping and human code confirmation. Short-circuits cases with missing documents to `action_required` (with `missing_requirements` array populated) and advances valid cases to `ready_for_dispatch`.
+  - Added `docs_updated` trigger handling to skip semantic mapping and evaluate pre-flight rules directly when documents are added.
+  - Added `POST /api/v1/cases/{case_id}/documents` endpoint in `src/mediplug/gateway/main.py` with `UploadDocumentsRequest` in `src/mediplug/schemas.py`.
+  - Validated Step 7 & 8 live end-to-end: Ingested case with missing documents -> halted at `action_required` -> uploaded missing files via `/documents` -> worker re-evaluated and flipped status to `ready_for_dispatch`. Tested zero-requirement package drill (sails directly to `ready_for_dispatch`).
+  - Full regression test suite: **16/16 passed** (`tests/test_contracts.py`, `tests/test_mapper.py`, `tests/test_normalize.py`, `tests/test_rules.py`).
+- **Phase 7 Readiness Assessment (Next Day 5 Target):**
+  - FHIR Bundle assembly (`src/mediplug/fhir/builder.py`) using `Claim`, `Patient`, `Coverage`, `Condition`, `Binary` resources.
+  - HCX / Payer Dispatch gateway and worker integration.

@@ -11,6 +11,20 @@ Run it:
 
 from __future__ import annotations
 
+import asyncio
+import sys
+
+# psycopg3's async pool refuses to run under Windows' default
+# ProactorEventLoop — it needs a selector-based loop to manage sockets.
+# This MUST run before uvicorn (or anything else) creates the event loop,
+# which is why it's the very first thing in this module, above every
+# other import. uvicorn imports this module before it creates its loop,
+# so setting the policy here — not in the CLI command, not in lifespan —
+# is what actually takes effect in time.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+
 import secrets
 import uuid
 from contextlib import asynccontextmanager
@@ -30,6 +44,7 @@ from ..schemas import (
     IngestRequest,
     IngestResponse,
     JobEnvelope,
+    UploadDocumentsRequest,
 )
 
 configure()
@@ -317,4 +332,104 @@ async def confirm_code(case_id: uuid.UUID, body: ConfirmCodeRequest) -> dict:
         "status": CaseStatus.QUEUED.value,
         "mapped_package_code": body.code,
         "mapped_package_name": package_name,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Upload documents (human-in-the-loop, Phase 6)
+# ---------------------------------------------------------------------------
+
+@app.post("/api/v1/cases/{case_id}/documents", status_code=200)
+async def upload_documents(
+    case_id: uuid.UUID,
+    body: UploadDocumentsRequest,
+) -> dict:
+    """Upload one or more documents to an existing case and re-enqueue for rule evaluation.
+
+    1. Validates the case exists (404 if not found).
+    2. Inserts document row(s) into case_documents.
+    3. Transitions status back to 'queued'.
+    4. Writes a case_events audit row.
+    5. Re-enqueues a JobEnvelope with trigger='docs_updated'.
+    """
+    case_str = str(case_id)
+    if not body.documents:
+        raise HTTPException(400, "Must provide at least one document to upload")
+
+    try:
+        async with db_pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "select status, stage, tracking_ref from cases where id = %s",
+                    (case_str,),
+                )
+                case_row = await cur.fetchone()
+                if not case_row:
+                    raise HTTPException(404, "Case not found")
+                prev_status, stage, tracking_ref = case_row
+
+                for doc in body.documents:
+                    await cur.execute(
+                        """
+                        insert into case_documents (case_id, document_type, file_url)
+                        values (%s, %s, %s)
+                        """,
+                        (case_str, doc.document_type, doc.file_url),
+                    )
+
+                await cur.execute(
+                    "update cases set status = %s where id = %s",
+                    (CaseStatus.QUEUED.value, case_str),
+                )
+
+                await cur.execute(
+                    """
+                    insert into case_events
+                        (case_id, from_status, to_status, actor, detail)
+                    values (%s, %s, %s, %s, %s)
+                    """,
+                    (
+                        case_str,
+                        prev_status,
+                        CaseStatus.QUEUED.value,
+                        body.uploaded_by,
+                        Json(
+                            {
+                                "uploaded_documents": [
+                                    {"document_type": d.document_type, "file_url": d.file_url}
+                                    for d in body.documents
+                                ],
+                                "uploaded_by": body.uploaded_by,
+                            }
+                        ),
+                    ),
+                )
+            await conn.commit()
+    except HTTPException:
+        raise
+    except psycopg.Error as exc:
+        log.error("db_error_on_upload_documents", case_id=case_str, error=str(exc))
+        raise HTTPException(500, "Database error during document upload") from exc
+
+    envelope = JobEnvelope(case_id=case_str, stage=stage, trigger="docs_updated")
+    try:
+        job_id = await enqueue(envelope)
+    except Exception as exc:
+        log.error("redis_enqueue_failed_on_upload_docs", case_id=case_str, error=str(exc))
+        job_id = None
+
+    log.info(
+        "documents_uploaded",
+        case_id=case_str,
+        count=len(body.documents),
+        uploaded_by=body.uploaded_by,
+        job_id=job_id,
+    )
+
+    return {
+        "case_id": case_str,
+        "tracking_ref": tracking_ref,
+        "status": CaseStatus.QUEUED.value,
+        "documents_added": len(body.documents),
+        "job_id": job_id,
     }

@@ -1,34 +1,46 @@
 """
-Worker pipeline — Phase 5 version.
+Worker pipeline — Phase 6 version.
 
-Handles semantic code mapping and confidence routing:
-  - Re-reads case from Postgres
-  - Marks case as 'analyzing' (without duplicate audit rows on retries)
-  - If trigger == 'code_confirmed' and mapped_package_code is set, skips mapping
-  - Otherwise runs map_notes in a thread (CPU-bound)
-  - Confidence routing:
-      >= 0.82: auto-accept -> 'ready_for_dispatch'
-      0.45 - 0.82: human confirm needed -> 'needs_code_confirmation'
-      < 0.45 or empty: unmapped -> 'action_required'
+Handles semantic code mapping, pre-flight rule checking, and confidence routing:
+  - Marks case as 'analyzing'
+  - If trigger in ('code_confirmed', 'docs_updated'):
+      Skips mapping and re-evaluates pre-flight rules for the confirmed code
+  - Otherwise runs map_notes in a worker thread (CPU-bound)
+  - If package code resolved (auto-accept):
+      Evaluates package requirements[stage] against uploaded case_documents
+      -> If satisfied: 'ready_for_dispatch' (missing_requirements=[])
+      -> If missing docs: 'action_required' (missing_requirements=[...])
+  - If confidence 0.45 - 0.82: 'needs_code_confirmation'
+  - If confidence < 0.45: 'action_required' (unmapped)
+
+All Postgres access in this module uses plain blocking psycopg (not the
+async pool from gateway/main.py — this is a separate worker process).
+Every call is routed through asyncio.to_thread() so a DB round-trip
+never stalls the worker's event loop, which would otherwise delay XACK/
+XAUTOCLAIM/heartbeat handling for every OTHER job in flight, not just
+this one. See sih/decisions.md for why this matters (same failure mode
+almost shipped once already in gateway/main.py, Phase 3).
 """
 
 from __future__ import annotations
 
 import asyncio
-
 import psycopg
 from psycopg.types.json import Json
 import structlog
 
 from ..config import settings
 from ..mapping.mapper import map_notes
+from ..rules.engine import evaluate, RuleEvaluation
 from ..schemas import CodeCandidate
 
 log = structlog.get_logger()
 
 
 def _set_status(case_id: str, new_status: str, **extra_fields: object) -> None:
-    """Transition a case to a new status in Postgres.
+    """Transition a case to a new status in Postgres. Synchronous/blocking —
+    callers MUST wrap this in asyncio.to_thread(), never call it directly
+    from async code.
 
     Writes an audit event to case_events ONLY if status actually changed.
     Values passed via extra_fields are SET on the cases row.
@@ -60,8 +72,36 @@ def _set_status(case_id: str, new_status: str, **extra_fields: object) -> None:
     log.info("status_transition", case_id=case_id, from_status=prev_status, to_status=new_status)
 
 
+def _check_rules_for_code(case_id: str, stage: str, package_code: str) -> RuleEvaluation:
+    """Fetch package requirements and uploaded docs, then evaluate.
+    Synchronous/blocking — callers MUST wrap this in asyncio.to_thread()."""
+    with psycopg.connect(settings.database_url) as conn, conn.cursor() as cur:
+        cur.execute("SELECT requirements FROM packages WHERE code = %s", (package_code,))
+        pkg_row = cur.fetchone()
+        stage_requirements = (pkg_row[0] or {}).get(stage, []) if pkg_row else []
+
+        cur.execute("SELECT document_type FROM case_documents WHERE case_id = %s", (case_id,))
+        doc_rows = cur.fetchall()
+        uploaded_doc_types = [r[0] for r in doc_rows]
+
+    return evaluate(stage_requirements, uploaded_doc_types)
+
+
+def _read_case_state(case_id: str) -> tuple[str, str | None, object] | None:
+    """Fetch the fields process_case needs fresh from the DB. Synchronous/
+    blocking — callers MUST wrap this in asyncio.to_thread(). Returns None
+    if the case doesn't exist."""
+    with psycopg.connect(settings.database_url) as conn, conn.cursor() as cur:
+        cur.execute(
+            """SELECT raw_clinical_notes, mapped_package_code, code_confirmed_at
+               FROM cases WHERE id = %s""",
+            (case_id,),
+        )
+        return cur.fetchone()
+
+
 async def process_case(job: dict) -> None:
-    """Process a single case job via semantic mapping & confidence routing."""
+    """Process a single case job via semantic mapping, rule engine & confidence routing."""
     case_id = job["case_id"]
     stage = job.get("stage", "preauth")
     trigger = job.get("trigger", "ingest")
@@ -70,26 +110,35 @@ async def process_case(job: dict) -> None:
     log.info("processing_case_start", trigger=trigger)
 
     # 1. Transition to analyzing
-    _set_status(case_id, "analyzing")
+    await asyncio.to_thread(_set_status, case_id, "analyzing")
 
     # 2. Re-read full case from DB for fresh state
-    with psycopg.connect(settings.database_url) as conn, conn.cursor() as cur:
-        cur.execute(
-            """SELECT raw_clinical_notes, mapped_package_code, code_confirmed_at
-               FROM cases WHERE id = %s""",
-            (case_id,),
-        )
-        row = cur.fetchone()
-        if not row:
-            log.error("case_not_found", case_id=case_id)
-            return
-        notes, existing_code, confirmed_at = row
+    row = await asyncio.to_thread(_read_case_state, case_id)
+    if not row:
+        log.error("case_not_found", case_id=case_id)
+        structlog.contextvars.unbind_contextvars("case_id", "stage")
+        return
+    notes, existing_code, confirmed_at = row
 
-    # 3. Check if already confirmed by human
-    if trigger == "code_confirmed" and existing_code and confirmed_at:
-        log.info("skipping_mapping_already_confirmed", code=existing_code)
-        _set_status(case_id, "ready_for_dispatch")
-        log.info("processing_case_done", final_status="ready_for_dispatch")
+    # 3. Check if trigger is code_confirmed or docs_updated (skip mapping, evaluate rules)
+    if trigger in ("code_confirmed", "docs_updated") and existing_code:
+        log.info("skipping_mapping_running_rules", trigger=trigger, code=existing_code)
+        rule_res = await asyncio.to_thread(_check_rules_for_code, case_id, stage, existing_code)
+        if rule_res.passed:
+            await asyncio.to_thread(
+                _set_status, case_id, "ready_for_dispatch", missing_requirements=Json([])
+            )
+        else:
+            await asyncio.to_thread(
+                _set_status,
+                case_id,
+                "action_required",
+                missing_requirements=Json(rule_res.missing_requirements),
+            )
+        log.info(
+            "processing_case_done",
+            final_status="ready_for_dispatch" if rule_res.passed else "action_required",
+        )
         structlog.contextvars.unbind_contextvars("case_id", "stage")
         return
 
@@ -98,11 +147,13 @@ async def process_case(job: dict) -> None:
 
     if not candidates:
         log.warning("no_code_candidates_found", case_id=case_id)
-        _set_status(
+        await asyncio.to_thread(
+            _set_status,
             case_id,
             "action_required",
             confidence=None,
             alternate_codes=Json([]),
+            missing_requirements=Json([]),
         )
         structlog.contextvars.unbind_contextvars("case_id", "stage")
         return
@@ -110,22 +161,26 @@ async def process_case(job: dict) -> None:
     best = candidates[0]
     alternate_json = Json([c.model_dump() for c in candidates])
 
-    # 5. Confidence routing
+    # 5. Confidence routing + Pre-flight rules
     if best.confidence >= settings.confidence_auto_accept:
-        # High confidence (>= 0.82): Auto-accept
+        # High confidence (>= 0.82): Auto-accept code, then check pre-flight document rules
         log.info(
             "auto_accept_package",
             code=best.code,
             name=best.name,
             confidence=best.confidence,
         )
-        _set_status(
+        rule_res = await asyncio.to_thread(_check_rules_for_code, case_id, stage, best.code)
+        target_status = "ready_for_dispatch" if rule_res.passed else "action_required"
+        await asyncio.to_thread(
+            _set_status,
             case_id,
-            "ready_for_dispatch",
+            target_status,
             mapped_package_code=best.code,
             mapped_package_name=best.name,
             confidence=best.confidence,
             alternate_codes=alternate_json,
+            missing_requirements=Json(rule_res.missing_requirements),
         )
     elif best.confidence >= settings.confidence_floor:
         # Borderline confidence (0.45 - 0.82): Human confirmation needed
@@ -135,11 +190,13 @@ async def process_case(job: dict) -> None:
             confidence=best.confidence,
         )
         # Note: Do NOT set mapped_package_code yet!
-        _set_status(
+        await asyncio.to_thread(
+            _set_status,
             case_id,
             "needs_code_confirmation",
             confidence=best.confidence,
             alternate_codes=alternate_json,
+            missing_requirements=Json([]),
         )
     else:
         # Low confidence (< 0.45): Flag as action required
@@ -147,11 +204,13 @@ async def process_case(job: dict) -> None:
             "confidence_below_floor",
             confidence=best.confidence,
         )
-        _set_status(
+        await asyncio.to_thread(
+            _set_status,
             case_id,
             "action_required",
             confidence=best.confidence,
             alternate_codes=alternate_json,
+            missing_requirements=Json([]),
         )
 
     log.info("processing_case_done")

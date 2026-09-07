@@ -71,20 +71,22 @@ def map_notes(notes: str, top_k: int = 3) -> list[CodeCandidate]:
     q_emb = _model().encode([query], normalize_embeddings=True)[0]
     sims = embeddings[idxs] @ q_emb
 
-    order = np.argsort(-sims)[:top_k]
+    # Blend semantic + lexical for EVERY shortlisted candidate first —
+    # selecting top_k by sims alone would drop a candidate that has a
+    # strong lexical hit but only a middling semantic score, exactly
+    # the case this blend exists to catch (see module docstring).
+    lexical_scores = np.array([prefilter[i][1] / 100.0 for i in range(len(idxs))])
+    blended = 0.7 * sims + 0.3 * lexical_scores
+
+    order = np.argsort(-blended)[:top_k]
     out: list[CodeCandidate] = []
     for rank in order:
         row = rows[idxs[rank]]
-        lexical = prefilter[rank][1] / 100.0
-        # Blend so an exact-name lexical hit scores high even if the
-        # embedding model doesn't rate it as the closest semantic match.
-        score = 0.7 * float(sims[rank]) + 0.3 * lexical
+        score = float(np.clip(blended[rank], 0.0, 1.0))
         out.append(
-            CodeCandidate(
-                code=row.code, name=row.name, confidence=round(min(score, 1.0), 3)
-            )
+            CodeCandidate(code=row.code, name=row.name, confidence=round(score, 3))
         )
-    return sorted(out, key=lambda c: -c.confidence)
+    return out  # already sorted by blended confidence, descending
 
 
 def cache_key() -> str:

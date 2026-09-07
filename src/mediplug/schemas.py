@@ -145,3 +145,10 @@ class ConfirmCodeRequest(BaseModel):
     code: str
     confirmed_by: str = "aarogyamitra"
 
+
+class UploadDocumentsRequest(BaseModel):
+    """Payload for POST /api/v1/cases/{case_id}/documents."""
+
+    documents: list[Document] = Field(default_factory=list)
+    uploaded_by: str = "aarogyamitra"
+

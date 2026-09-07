@@ -12,6 +12,20 @@ Responsibilities:
 from __future__ import annotations
 
 import asyncio
+import sys
+
+# psycopg3's async pool refuses to run under Windows' default
+# ProactorEventLoop — it needs a selector-based loop to manage sockets.
+# This MUST run before uvicorn (or anything else) creates the event loop,
+# which is why it's the very first thing in this module, above every
+# other import. uvicorn imports this module before it creates its loop,
+# so setting the policy here — not in the CLI command, not in lifespan —
+# is what actually takes effect in time.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+
+import asyncio
 import json
 import socket
 
