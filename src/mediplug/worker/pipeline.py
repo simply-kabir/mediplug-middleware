@@ -106,120 +106,123 @@ async def process_case(job: dict) -> None:
     case_id = job["case_id"]
     stage = job.get("stage", "preauth")
     trigger = job.get("trigger", "ingest")
-    structlog.contextvars.bind_contextvars(case_id=case_id, stage=stage)
 
-    log.info("processing_case_start", trigger=trigger)
+    # bound_contextvars (not bind_ + manual unbinds): it restores prior
+    # values on exit AND covers the exception path, so job_failed /
+    # job_dead_lettered lines no longer carry the *previous* case's id
+    # (bug #5). Not clear_contextvars() — that would wipe anything a caller
+    # bound above process_case.
+    with structlog.contextvars.bound_contextvars(case_id=case_id, stage=stage):
+        log.info("processing_case_start", trigger=trigger)
 
-    # 1. Transition to analyzing
-    await asyncio.to_thread(_set_status, case_id, "analyzing")
+        # 1. Transition to analyzing
+        await asyncio.to_thread(_set_status, case_id, "analyzing")
 
-    # 2. Re-read full case from DB for fresh state
-    row = await asyncio.to_thread(_read_case_state, case_id)
-    if not row:
-        log.error("case_not_found", case_id=case_id)
-        structlog.contextvars.unbind_contextvars("case_id", "stage")
-        return
-    notes, existing_code, confirmed_at = row
+        # 2. Re-read full case from DB for fresh state
+        row = await asyncio.to_thread(_read_case_state, case_id)
+        if not row:
+            log.error("case_not_found", case_id=case_id)
+            return
+        notes, existing_code, confirmed_at = row
 
-    # 3. Check if trigger is code_confirmed or docs_updated (skip mapping, evaluate rules)
-    if trigger in ("code_confirmed", "docs_updated") and existing_code:
-        log.info("skipping_mapping_running_rules", trigger=trigger, code=existing_code)
-        rule_res = await asyncio.to_thread(_check_rules_for_code, case_id, stage, existing_code)
-        if rule_res.passed:
-            await asyncio.to_thread(
-                _set_status, case_id, "ready_for_dispatch", missing_requirements=Json([])
+        # 3. Check if trigger is code_confirmed or docs_updated (skip mapping, evaluate rules)
+        if trigger in ("code_confirmed", "docs_updated") and existing_code:
+            log.info("skipping_mapping_running_rules", trigger=trigger, code=existing_code)
+            rule_res = await asyncio.to_thread(
+                _check_rules_for_code, case_id, stage, existing_code
             )
-            # Phase 7 + 8: build FHIR bundle, dispatch to payer, -> submitted.
-            # Re-raises on failure so consumer.py runs its retry -> DLQ path.
-            await finalize_case(case_id)
-        else:
+            if rule_res.passed:
+                await asyncio.to_thread(
+                    _set_status, case_id, "ready_for_dispatch", missing_requirements=Json([])
+                )
+                # Phase 7 + 8: build FHIR bundle, dispatch to payer, -> submitted.
+                # Re-raises on failure so consumer.py runs its retry -> DLQ path.
+                await finalize_case(case_id)
+            else:
+                await asyncio.to_thread(
+                    _set_status,
+                    case_id,
+                    "action_required",
+                    missing_requirements=Json(rule_res.missing_requirements),
+                )
+            log.info(
+                "processing_case_done",
+                final_status="ready_for_dispatch" if rule_res.passed else "action_required",
+            )
+            return
+
+        # 4. Run semantic code mapping in a separate thread (CPU-bound)
+        candidates: list[CodeCandidate] = await asyncio.to_thread(map_notes, notes, 3)
+
+        if not candidates:
+            log.warning("no_code_candidates_found", case_id=case_id)
             await asyncio.to_thread(
                 _set_status,
                 case_id,
                 "action_required",
+                confidence=None,
+                alternate_codes=Json([]),
+                missing_requirements=Json([]),
+            )
+            return
+
+        best = candidates[0]
+        alternate_json = Json([c.model_dump() for c in candidates])
+
+        # 5. Confidence routing + Pre-flight rules
+        if best.confidence >= settings.confidence_auto_accept:
+            # High confidence (>= 0.82): Auto-accept code, then check pre-flight document rules
+            log.info(
+                "auto_accept_package",
+                code=best.code,
+                name=best.name,
+                confidence=best.confidence,
+            )
+            rule_res = await asyncio.to_thread(_check_rules_for_code, case_id, stage, best.code)
+            target_status = "ready_for_dispatch" if rule_res.passed else "action_required"
+            await asyncio.to_thread(
+                _set_status,
+                case_id,
+                target_status,
+                mapped_package_code=best.code,
+                mapped_package_name=best.name,
+                confidence=best.confidence,
+                alternate_codes=alternate_json,
                 missing_requirements=Json(rule_res.missing_requirements),
             )
-        log.info(
-            "processing_case_done",
-            final_status="ready_for_dispatch" if rule_res.passed else "action_required",
-        )
-        structlog.contextvars.unbind_contextvars("case_id", "stage")
-        return
+            if rule_res.passed:
+                # Phase 7 + 8: build FHIR bundle, dispatch to payer, -> submitted.
+                # Re-raises on failure so consumer.py runs its retry -> DLQ path.
+                await finalize_case(case_id)
+        elif best.confidence >= settings.confidence_floor:
+            # Borderline confidence (0.45 - 0.82): Human confirmation needed
+            log.info(
+                "needs_human_confirmation",
+                top_code=best.code,
+                confidence=best.confidence,
+            )
+            # Note: Do NOT set mapped_package_code yet!
+            await asyncio.to_thread(
+                _set_status,
+                case_id,
+                "needs_code_confirmation",
+                confidence=best.confidence,
+                alternate_codes=alternate_json,
+                missing_requirements=Json([]),
+            )
+        else:
+            # Low confidence (< 0.45): Flag as action required
+            log.warning(
+                "confidence_below_floor",
+                confidence=best.confidence,
+            )
+            await asyncio.to_thread(
+                _set_status,
+                case_id,
+                "action_required",
+                confidence=best.confidence,
+                alternate_codes=alternate_json,
+                missing_requirements=Json([]),
+            )
 
-    # 4. Run semantic code mapping in a separate thread (CPU-bound)
-    candidates: list[CodeCandidate] = await asyncio.to_thread(map_notes, notes, 3)
-
-    if not candidates:
-        log.warning("no_code_candidates_found", case_id=case_id)
-        await asyncio.to_thread(
-            _set_status,
-            case_id,
-            "action_required",
-            confidence=None,
-            alternate_codes=Json([]),
-            missing_requirements=Json([]),
-        )
-        structlog.contextvars.unbind_contextvars("case_id", "stage")
-        return
-
-    best = candidates[0]
-    alternate_json = Json([c.model_dump() for c in candidates])
-
-    # 5. Confidence routing + Pre-flight rules
-    if best.confidence >= settings.confidence_auto_accept:
-        # High confidence (>= 0.82): Auto-accept code, then check pre-flight document rules
-        log.info(
-            "auto_accept_package",
-            code=best.code,
-            name=best.name,
-            confidence=best.confidence,
-        )
-        rule_res = await asyncio.to_thread(_check_rules_for_code, case_id, stage, best.code)
-        target_status = "ready_for_dispatch" if rule_res.passed else "action_required"
-        await asyncio.to_thread(
-            _set_status,
-            case_id,
-            target_status,
-            mapped_package_code=best.code,
-            mapped_package_name=best.name,
-            confidence=best.confidence,
-            alternate_codes=alternate_json,
-            missing_requirements=Json(rule_res.missing_requirements),
-        )
-        if rule_res.passed:
-            # Phase 7 + 8: build FHIR bundle, dispatch to payer, -> submitted.
-            # Re-raises on failure so consumer.py runs its retry -> DLQ path.
-            await finalize_case(case_id)
-    elif best.confidence >= settings.confidence_floor:
-        # Borderline confidence (0.45 - 0.82): Human confirmation needed
-        log.info(
-            "needs_human_confirmation",
-            top_code=best.code,
-            confidence=best.confidence,
-        )
-        # Note: Do NOT set mapped_package_code yet!
-        await asyncio.to_thread(
-            _set_status,
-            case_id,
-            "needs_code_confirmation",
-            confidence=best.confidence,
-            alternate_codes=alternate_json,
-            missing_requirements=Json([]),
-        )
-    else:
-        # Low confidence (< 0.45): Flag as action required
-        log.warning(
-            "confidence_below_floor",
-            confidence=best.confidence,
-        )
-        await asyncio.to_thread(
-            _set_status,
-            case_id,
-            "action_required",
-            confidence=best.confidence,
-            alternate_codes=alternate_json,
-            missing_requirements=Json([]),
-        )
-
-    log.info("processing_case_done")
-    structlog.contextvars.unbind_contextvars("case_id", "stage")
+        log.info("processing_case_done")

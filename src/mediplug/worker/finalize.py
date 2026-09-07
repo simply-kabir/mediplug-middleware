@@ -20,13 +20,22 @@ Failure model matches the rest of the pipeline: record `error_message`
 (and the dispatch response, if we got one) FIRST, then re-raise so
 `worker/consumer.py` runs its retry → DLQ path. Nothing is ever swallowed.
 
+Duplicate-dispatch guard (Phase 9.4): a re-delivered job used to re-POST to
+the payer and let `_persist_dispatch` overwrite `payer_correlation_id`,
+orphaning the first submission so it could never be adjudicated back.
+`finalize_case` now short-circuits when `cases.payer_correlation_id` is
+already set. If the row is still `dispatching` (the crash window between
+`_persist_dispatch` and the `submitted` transition), it heals forward to
+`submitted` before returning.
+
 Retry note: a retried job re-runs `finalize_case` from the top. Rebuilding
-the bundle is pure and cheap; the `UPDATE`s are idempotent; a re-submit to
-the payer mints a fresh `correlation_id`. Acceptable for the demo — flag
-for the transactional rework in Phase 9.
+the bundle is pure and cheap; the `UPDATE`s are idempotent. Full
+transactional rework is still deferred Phase 9 tech debt.
 """
 
 from __future__ import annotations
+
+import asyncio
 
 import psycopg
 import structlog
@@ -84,6 +93,22 @@ def _load_inputs(case_id: str) -> tuple[dict, dict, list[dict], str]:
     case = {"patient": patient, "encounter": encounter}
     package = {"code": pcode, "name": pname, "amount": pamount, "icd_code": picd}
     return case, package, documents, (stage or "preauth")
+
+
+def _dispatch_state(case_id: str) -> tuple[str | None, str]:
+    """(payer_correlation_id, status) for the Phase 9.4 duplicate-dispatch
+    guard. A dedicated seam, NOT a widening of `_load_inputs`: that returns
+    a fixed 4-tuple which `tests/test_finalize.py`'s `wired` fixture
+    replaces wholesale, so changing its arity breaks all six existing tests.
+    """
+    with _connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT payer_correlation_id, status FROM cases WHERE id = %s", (case_id,)
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise LookupError(f"case {case_id} not found")
+        return row[0], row[1]
 
 
 def _transition(case_id: str, new_status: str, **fields: object) -> None:
@@ -148,8 +173,32 @@ async def finalize_case(case_id: str, *, dispatcher: Dispatcher | None = None) -
 
     `dispatcher` is an injection seam for tests; production leaves it None
     and `get_dispatcher()` resolves it from `settings.dispatch_mode`.
+
+    Every sync `psycopg` helper below is routed through `asyncio.to_thread`
+    so a blocking DB round-trip does not stall the worker's event loop for
+    the whole ~93s dispatch — the same treatment `pipeline.py` gives its
+    equivalents. (Test fixtures patch these seams with sync lambdas, which
+    run fine under `to_thread`.)
     """
-    case, package, documents, stage = _load_inputs(case_id)
+    # ---- Phase 9.4: duplicate-dispatch guard ---------------------------
+    # The predicate is `payer_correlation_id IS NOT NULL` — nothing more. A
+    # status allow-list would miss the exact crash window drill 1 tests:
+    # between _persist_dispatch and _transition(..., "submitted") the row is
+    # `dispatching` WITH the correlation id already set. Guard on the id
+    # alone; when the row is stuck at `dispatching`, heal it forward.
+    corr_id, current_status = await asyncio.to_thread(_dispatch_state, case_id)
+    if corr_id is not None:
+        log.info(
+            "finalize_skipped",
+            case_id=case_id,
+            reason="already_dispatched",
+            status=current_status,
+        )
+        if current_status == "dispatching":
+            await asyncio.to_thread(_transition, case_id, "submitted")
+        return
+
+    case, package, documents, stage = await asyncio.to_thread(_load_inputs, case_id)
 
     # ---- Phase 7: build + validate + persist -----------------------------
     bundle = build_claim_bundle(case, package, documents, stage)
@@ -157,28 +206,28 @@ async def finalize_case(case_id: str, *, dispatcher: Dispatcher | None = None) -
         validate(bundle)
     except ValidationError as exc:
         log.error("fhir_validation_failed", case_id=case_id, error=str(exc))
-        _record_error(case_id, f"FHIR validation failed: {exc}")
+        await asyncio.to_thread(_record_error, case_id, f"FHIR validation failed: {exc}")
         raise
-    _persist_bundle(case_id, bundle)
+    await asyncio.to_thread(_persist_bundle, case_id, bundle)
     log.info("fhir_bundle_built", case_id=case_id, entries=len(bundle["entry"]))
 
     # ---- Phase 8: dispatch ----------------------------------------------
-    _transition(case_id, "dispatching")
+    await asyncio.to_thread(_transition, case_id, "dispatching")
     try:
         result = await (dispatcher or get_dispatcher()).submit(bundle, stage)
     except Exception as exc:
         log.error("dispatch_error", case_id=case_id, error=str(exc))
-        _record_error(case_id, f"dispatch error: {exc}")
-        _transition(case_id, "dispatch_failed")
+        await asyncio.to_thread(_record_error, case_id, f"dispatch error: {exc}")
+        await asyncio.to_thread(_transition, case_id, "dispatch_failed")
         raise
 
-    _persist_dispatch(case_id, bundle, result)
+    await asyncio.to_thread(_persist_dispatch, case_id, bundle, result)
 
     if not result.accepted:
         log.warning("dispatch_rejected", case_id=case_id, error=result.error)
-        _record_error(case_id, f"dispatch rejected: {result.error}")
-        _transition(case_id, "dispatch_failed")
+        await asyncio.to_thread(_record_error, case_id, f"dispatch rejected: {result.error}")
+        await asyncio.to_thread(_transition, case_id, "dispatch_failed")
         raise RuntimeError(f"dispatch rejected: {result.error}")
 
-    _transition(case_id, "submitted")
+    await asyncio.to_thread(_transition, case_id, "submitted")
     log.info("dispatch_submitted", case_id=case_id, correlation_id=result.correlation_id)
