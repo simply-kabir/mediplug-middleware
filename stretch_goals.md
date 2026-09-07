@@ -9,6 +9,26 @@
 
 ---
 
+## 0. Anti-Fraud & Clinical Integrity Engine (Healthcare FWA Prevention)
+
+**The idea:** Protect national healthcare schemes (e.g. PM-JAY / ABDM) from fraudulent, duplicate, and abusive claims before they leave the hospital edge.
+
+### Architecture & Implementation Roadmap:
+1. **ABHA Identity & Checksum Validation:**
+   - Validate 14-digit numeric ABHA (`XX-XXXX-XXXX-XXXX`) and PHR address format (`user@abdm`). Reject repetitive dummy sequences (`00-0000-0000-0000`).
+   - Hook into `gateway/main.py` on `POST /api/v1/cases/ingest` for fast fail-early rejection (`400 Bad Request`).
+2. **Simultaneous Active Inpatient Admission Check (Ghost Hospital Admissions):**
+   - Query PostgreSQL for concurrent active, un-discharged admissions (`encounter->>'discharge_date' IS NULL`) under the same ABHA across different hospitals.
+   - Halt conflicting claims at `action_required` with explicit fraud alerts logged in `case_events` (`actor='anti_fraud_engine'`).
+3. **Historical Procedure Restrictions (Anatomical Impossibility + Cooldown Windows):**
+   - **Lifetime Single-Excision Registry:** Organs that can never be excised twice (Gallbladder `S8G5.11`, Appendix `S8G4.1`, Uterus `S4G1.1`, Spleen `S8G12.1`).
+   - **Procedure Cooldown Windows:** Mandatory minimum intervals between repeatable procedures (e.g. Cataract surgery on same eye $\ge 3\text{ years}$, Stents $\ge 6\text{ months}$).
+   - Short-circuit re-claims to `action_required` with remaining days or prior claim references.
+4. **Validation Suite:**
+   - Isolated unit tests in `tests/test_fraud.py` covering format validation, temporal collision, anatomical impossibility, and cooldown date math.
+
+---
+
 ## 1. Multi-hospital adapter pattern (SIH wow-factor idea)
 
 **The idea:** real hospitals run different EMR systems with different field
