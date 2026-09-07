@@ -33,6 +33,7 @@ from ..config import settings
 from ..mapping.mapper import map_notes
 from ..rules.engine import evaluate, RuleEvaluation
 from ..schemas import CodeCandidate
+from .finalize import finalize_case
 
 log = structlog.get_logger()
 
@@ -128,6 +129,9 @@ async def process_case(job: dict) -> None:
             await asyncio.to_thread(
                 _set_status, case_id, "ready_for_dispatch", missing_requirements=Json([])
             )
+            # Phase 7 + 8: build FHIR bundle, dispatch to payer, -> submitted.
+            # Re-raises on failure so consumer.py runs its retry -> DLQ path.
+            await finalize_case(case_id)
         else:
             await asyncio.to_thread(
                 _set_status,
@@ -182,6 +186,10 @@ async def process_case(job: dict) -> None:
             alternate_codes=alternate_json,
             missing_requirements=Json(rule_res.missing_requirements),
         )
+        if rule_res.passed:
+            # Phase 7 + 8: build FHIR bundle, dispatch to payer, -> submitted.
+            # Re-raises on failure so consumer.py runs its retry -> DLQ path.
+            await finalize_case(case_id)
     elif best.confidence >= settings.confidence_floor:
         # Borderline confidence (0.45 - 0.82): Human confirmation needed
         log.info(

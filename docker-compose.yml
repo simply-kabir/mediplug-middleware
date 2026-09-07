@@ -17,6 +17,25 @@ services:
       POSTGRES_DB: mediplug
     volumes: [pg-data:/var/lib/postgresql/data]
 
+  # Phase 8 — stand-in MJPJAY/NHCX payer. No Dockerfile needed: the uv
+  # image runs the app straight from the mounted source with just fastapi
+  # + uvicorn pulled in (--no-project keeps the heavy ML deps out).
+  #   docker compose up mock_payer      ->  http://localhost:8081
+  mock_payer:
+    image: ghcr.io/astral-sh/uv:python3.11-bookworm-slim
+    working_dir: /app
+    volumes: ["./mock_payer:/app/mock_payer:ro"]
+    command: >
+      uv run --no-project
+      --with fastapi --with "uvicorn[standard]"
+      uvicorn mock_payer.main:app --host 0.0.0.0 --port 8081
+    ports: ["8081:8081"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8081/healthz').status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
 volumes:
   redis-data:
   pg-data:
