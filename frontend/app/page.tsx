@@ -11,18 +11,42 @@ import {
 // ---------------------------------------------------------------------------
 // Supabase Client Initialization (Direct Realtime Connection)
 // ---------------------------------------------------------------------------
+// The hardcoded fallback KEY here used to be a service_role JWT — RLS-bypassing,
+// full-privilege, shipped to every visitor, and in git history. It is gone.
+// Supply the ANON key via env (rls.sql grants public SELECT on all four tables,
+// so Realtime works on anon and no write path opens up). Copy
+// frontend/.env.example -> frontend/.env.local (gitignored) and fill it in.
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || "https://rnmjetheinheufqqsfeq.supabase.co";
-const SUPABASE_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJubWpldGhlaW5oZXVmcXFzZmVxIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4ODYwMzg2OSwiZXhwIjoyMTA0MTc5ODY5fQ.Dy39jmQZXO-hBLX8LDRpVvnWnadIKXyquZf4ryXHm1Q";
+const SUPABASE_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || "";
 const GATEWAY_URL = process.env.NEXT_PUBLIC_GATEWAY_URL || "http://localhost:8000";
+const ADMIN_TOKEN = process.env.NEXT_PUBLIC_ADMIN_TOKEN || "dev-admin-token";
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+if (typeof window !== "undefined" && !SUPABASE_KEY) {
+  // Loud runtime failure (not a build-time throw — client components still
+  // prerender on the server). The UI will show "Disconnected".
+  console.error(
+    "Missing NEXT_PUBLIC_SUPABASE_ANON_KEY — copy frontend/.env.example to frontend/.env.local and set the anon key."
+  );
+}
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY || "anon-key-not-set");
 
 type Case = {
   id: string;
   tracking_ref: string;
   hms_case_ref: string;
   stage: string;
-  status: 'queued' | 'analyzing' | 'needs_code_confirmation' | 'action_required' | 'ready_for_dispatch' | 'submitted';
+  status:
+    | 'queued'
+    | 'analyzing'
+    | 'needs_code_confirmation'
+    | 'action_required'
+    | 'ready_for_dispatch'
+    | 'dispatching'
+    | 'submitted'
+    | 'dispatch_failed'
+    | 'payer_approved'
+    | 'payer_rejected';
   patient: { name: string; gender: string; birth_date: string };
   encounter: { attending_doctor: string; hospital_id: string };
   raw_clinical_notes: string;
@@ -31,6 +55,13 @@ type Case = {
   mapped_package_name?: string;
   confidence?: number;
   alternate_codes?: { code: string; name: string; confidence: number }[];
+  payer_correlation_id?: string;
+};
+
+type QueueStats = {
+  stream_length: number;
+  dlq_length: number;
+  pending: number;
 };
 
 export default function AarogyamitraPortal() {
@@ -42,6 +73,31 @@ export default function AarogyamitraPortal() {
   const [error, setError] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<string>("ALL");
+  const [queueStats, setQueueStats] = useState<QueueStats | null>(null);
+
+  // Live queue-depth panel — guide §11.2 ("a strong architecture demo"),
+  // stretch_goals.md item 2. Polls the gateway's /admin/queue every 2s.
+  useEffect(() => {
+    let active = true;
+    async function pollQueue() {
+      try {
+        const res = await fetch(`${GATEWAY_URL}/admin/queue`, {
+          headers: { "X-Admin-Token": ADMIN_TOKEN },
+        });
+        if (!res.ok) throw new Error(`admin/queue ${res.status}`);
+        const data = await res.json();
+        if (active) setQueueStats(data);
+      } catch {
+        if (active) setQueueStats(null);
+      }
+    }
+    pollQueue();
+    const id = setInterval(pollQueue, 2000);
+    return () => {
+      active = false;
+      clearInterval(id);
+    };
+  }, []);
 
   useEffect(() => {
     // 1. Initial Load: Fetch all live cases directly from Supabase
@@ -144,10 +200,23 @@ export default function AarogyamitraPortal() {
         return <span className="inline-flex items-center px-2.5 py-1 bg-rose-50 text-rose-700 border border-rose-200 rounded-full text-xs font-semibold tracking-wide"><AlertCircle className="w-3.5 h-3.5 mr-1 text-rose-500" /> Action Required</span>;
       case 'needs_code_confirmation': 
         return <span className="inline-flex items-center px-2.5 py-1 bg-indigo-50 text-indigo-700 border border-indigo-200 rounded-full text-xs font-semibold tracking-wide shadow-sm"><Activity className="w-3.5 h-3.5 mr-1 text-indigo-500" /> Confirm Code</span>;
-      case 'ready_for_dispatch': 
+      case 'ready_for_dispatch':
         return <span className="inline-flex items-center px-2.5 py-1 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-full text-xs font-semibold tracking-wide"><CheckCircle2 className="w-3.5 h-3.5 mr-1 text-emerald-500" /> Dispatch Ready</span>;
-      default: 
+      case 'dispatching':
+        return <span className="inline-flex items-center px-2.5 py-1 bg-sky-50 text-sky-700 border border-sky-200 rounded-full text-xs font-semibold tracking-wide"><Loader2 className="w-3.5 h-3.5 mr-1 animate-spin text-sky-500" /> Dispatching</span>;
+      case 'submitted':
+        return <span className="inline-flex items-center px-2.5 py-1 bg-blue-50 text-blue-700 border border-blue-200 rounded-full text-xs font-semibold tracking-wide"><UploadCloud className="w-3.5 h-3.5 mr-1 text-blue-500" /> Submitted to Payer</span>;
+      case 'dispatch_failed':
+        return <span className="inline-flex items-center px-2.5 py-1 bg-rose-50 text-rose-700 border border-rose-200 rounded-full text-xs font-semibold tracking-wide"><AlertCircle className="w-3.5 h-3.5 mr-1 text-rose-500" /> Dispatch Failed</span>;
+      case 'payer_approved':
+        return <span className="inline-flex items-center px-2.5 py-1 bg-emerald-600 text-white border border-emerald-700 rounded-full text-xs font-bold tracking-wide shadow-sm"><CheckCircle2 className="w-3.5 h-3.5 mr-1 text-white" /> Payer Approved</span>;
+      case 'payer_rejected':
+        return <span className="inline-flex items-center px-2.5 py-1 bg-rose-600 text-white border border-rose-700 rounded-full text-xs font-bold tracking-wide shadow-sm"><X className="w-3.5 h-3.5 mr-1 text-white" /> Payer Rejected</span>;
+      case 'queued':
         return <span className="inline-flex items-center px-2.5 py-1 bg-slate-100 text-slate-600 border border-slate-200 rounded-full text-xs font-medium">Queued</span>;
+      default:
+        // Never lie about the state — render whatever the row actually says.
+        return <span className="inline-flex items-center px-2.5 py-1 bg-slate-100 text-slate-600 border border-slate-200 rounded-full text-xs font-medium">{status}</span>;
     }
   };
 
@@ -156,6 +225,8 @@ export default function AarogyamitraPortal() {
     needsConfirm: cases.filter(c => c.status === 'needs_code_confirmation').length,
     actionReq: cases.filter(c => c.status === 'action_required').length,
     ready: cases.filter(c => c.status === 'ready_for_dispatch').length,
+    submitted: cases.filter(c => c.status === 'submitted' || c.status === 'dispatching').length,
+    approved: cases.filter(c => c.status === 'payer_approved').length,
   };
 
   const filteredCases = cases.filter((c) => {
@@ -186,7 +257,18 @@ export default function AarogyamitraPortal() {
             </div>
           </div>
 
-          <div className="flex items-center space-x-4">
+          <div className="flex items-center space-x-3">
+            {queueStats && (
+              <div className="hidden sm:flex items-center space-x-3 px-3 py-1.5 bg-slate-800/80 rounded-full border border-slate-700/80 backdrop-blur-sm font-mono text-xs text-slate-300">
+                <span title="Redis stream length">queue <span className="font-bold text-white">{queueStats.stream_length}</span></span>
+                <span className="text-slate-600">|</span>
+                <span title="Unacked (in-flight) messages">pending <span className="font-bold text-white">{queueStats.pending}</span></span>
+                <span className="text-slate-600">|</span>
+                <span title="Dead-letter queue length" className={queueStats.dlq_length > 0 ? "text-rose-400" : ""}>
+                  dlq <span className="font-bold">{queueStats.dlq_length}</span>
+                </span>
+              </div>
+            )}
             <div className="flex items-center px-3 py-1.5 bg-slate-800/80 rounded-full border border-slate-700/80 backdrop-blur-sm">
               <div className={`w-2 h-2 rounded-full mr-2 ${error ? 'bg-rose-500' : 'bg-emerald-400 animate-pulse'}`}></div>
               <span className="text-xs font-medium text-slate-300">
@@ -490,9 +572,23 @@ export default function AarogyamitraPortal() {
                     <div className="flex items-center text-rose-800 font-bold text-sm mb-2">
                       <AlertCircle className="w-4 h-4 mr-2 text-rose-600" /> Pre-Flight Requirements Missing
                     </div>
-                    <p className="text-xs text-rose-700 mb-4 leading-relaxed">
-                      This claim requires human intervention. Mandatory diagnostic scan or investigation report is missing from the record.
+                    <p className="text-xs text-rose-700 mb-3 leading-relaxed">
+                      This claim requires human intervention. The pre-flight rule engine flagged the following unmet requirements:
                     </p>
+                    {selectedCase.missing_requirements && selectedCase.missing_requirements.length > 0 ? (
+                      <ul className="mb-4 space-y-1.5">
+                        {selectedCase.missing_requirements.map((req, i) => (
+                          <li key={i} className="flex items-start text-xs text-rose-800 bg-white border border-rose-200 rounded-lg px-3 py-2">
+                            <AlertCircle className="w-3.5 h-3.5 mr-2 mt-0.5 text-rose-500 shrink-0" />
+                            <span className="font-medium">{req.human_label}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <p className="text-xs text-rose-700 mb-4 italic">
+                        Mandatory diagnostic scan or investigation report is missing from the record.
+                      </p>
+                    )}
                     <div className="border-2 border-dashed border-rose-300 bg-white rounded-xl p-6 text-center cursor-pointer hover:bg-rose-50/50 transition-colors">
                       <UploadCloud className="w-8 h-8 text-rose-400 mx-auto mb-2" />
                       <div className="text-xs font-bold text-rose-600">Upload Missing Diagnostic Scan (PDF, JPG)</div>

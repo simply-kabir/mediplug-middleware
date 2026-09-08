@@ -43,6 +43,7 @@ import structlog
 from psycopg.types.json import Json
 
 from ..config import settings
+from ..shutdown import install_handlers, shutdown_event
 
 log = structlog.get_logger()
 
@@ -164,15 +165,20 @@ async def run_poller(interval: int = POLL_INTERVAL_SECS) -> None:
         log.info("adjudication_poller_disabled", dispatch_mode=settings.dispatch_mode)
         return
 
+    install_handlers()
     log.info("adjudication_poller_started", interval=interval)
-    while True:
+    while not shutdown_event.is_set():
         try:
             n = await poll_once()
             if n:
                 log.info("adjudications_applied", count=n)
         except Exception as exc:
             log.error("adjudication_poll_error", error=str(exc))
-        await asyncio.sleep(interval)
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=interval)
+        except TimeoutError:  # 3.11: asyncio.TimeoutError is an alias of TimeoutError
+            pass
+    log.info("adjudication_poller_stopped")
 
 
 if __name__ == "__main__":

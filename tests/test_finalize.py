@@ -55,6 +55,10 @@ def wired(monkeypatch):
         "dispatch_persisted": None,
     }
     monkeypatch.setattr(finalize, "_load_inputs", lambda cid: state["inputs"])
+    # Phase 9.4 guard seam: default to "no prior dispatch" so the happy-path
+    # tests proceed. Individual tests override state["dispatch_state"].
+    state["dispatch_state"] = (None, "ready_for_dispatch")
+    monkeypatch.setattr(finalize, "_dispatch_state", lambda cid: state["dispatch_state"])
     monkeypatch.setattr(
         finalize, "_transition", lambda cid, s, **f: state["transitions"].append(s)
     )
@@ -143,3 +147,45 @@ async def test_default_dispatcher_is_resolved_when_not_injected(wired, monkeypat
 
     await finalize.finalize_case("case-1")
     assert d.calls and wired["transitions"] == ["dispatching", "submitted"]
+
+
+# --- Phase 9.4: duplicate-dispatch guard ----------------------------------
+
+
+@pytest.mark.asyncio
+async def test_guard_skips_when_correlation_id_already_set(wired):
+    """A re-delivered job whose case already has payer_correlation_id must
+    not re-build, re-persist, or re-POST."""
+    wired["dispatch_state"] = ("corr-existing", "submitted")
+    d = _FakeDispatcher(DispatchResult(True, "corr-new", {}))
+
+    await finalize.finalize_case("case-1", dispatcher=d)
+
+    assert wired["transitions"] == []
+    assert d.calls == []
+    assert wired["bundle_persisted"] is None
+    assert wired["dispatch_persisted"] is None
+
+
+@pytest.mark.asyncio
+async def test_guard_heals_forward_when_stuck_at_dispatching(wired):
+    """Crash window: correlation id set, status still 'dispatching'. The
+    guard transitions it to 'submitted' and returns — no re-dispatch."""
+    wired["dispatch_state"] = ("corr-existing", "dispatching")
+    d = _FakeDispatcher(DispatchResult(True, "x", {}))
+
+    await finalize.finalize_case("case-1", dispatcher=d)
+
+    assert wired["transitions"] == ["submitted"]
+    assert d.calls == []
+
+
+@pytest.mark.asyncio
+async def test_fresh_case_with_no_correlation_id_still_proceeds(wired):
+    wired["dispatch_state"] = (None, "ready_for_dispatch")
+    d = _FakeDispatcher(DispatchResult(True, "corr-1", {"result": "accepted"}))
+
+    await finalize.finalize_case("case-1", dispatcher=d)
+
+    assert wired["transitions"] == ["dispatching", "submitted"]
+    assert d.calls

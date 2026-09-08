@@ -1,0 +1,261 @@
+{
+  "id": "37acb6b4-4a69-414c-9c3a-4230f9d29d40",
+  "type": "collection",
+  "entry": [
+    {
+      "fullUrl": "urn:uuid:a9b0fadd-f030-445b-9b10-3140d1dce2e6",
+      "resource": {
+        "id": "a9b0fadd-f030-445b-9b10-3140d1dce2e6",
+        "use": "preauthorization",
+        "item": [
+          {
+            "sequence": 1,
+            "unitPrice": {
+              "value": 40000,
+              "currency": "INR"
+            },
+            "productOrService": {
+              "coding": [
+                {
+                  "code": "S8G5.11",
+                  "system": "https://www.jeevandayee.gov.in/package-code",
+                  "display": "Laparoscopic Choleycystectomy"
+                }
+              ]
+            }
+          }
+        ],
+        "type": {
+          "coding": [
+            {
+              "code": "institutional",
+              "system": "http://terminology.hl7.org/CodeSystem/claim-type"
+            }
+          ]
+        },
+        "total": {
+          "value": 40000,
+          "currency": "INR"
+        },
+        "status": "active",
+        "created": "2026-09-07T17:59:47.652273+00:00",
+        "insurer": {
+          "reference": "urn:uuid:65e402b8-d752-425f-b10d-5c394c19ba87"
+        },
+        "patient": {
+          "reference": "urn:uuid:e7289d14-318b-4e82-8e45-fedc55c780e5"
+        },
+        "careTeam": [
+          {
+            "provider": {
+              "reference": "urn:uuid:69770105-32c2-4df5-abc1-778c6db538ec"
+            },
+            "sequence": 1
+          }
+        ],
+        "priority": {
+          "coding": [
+            {
+              "code": "normal",
+              "system": "http://terminology.hl7.org/CodeSystem/processpriority"
+            }
+          ]
+        },
+        "provider": {
+          "reference": "urn:uuid:e78a2bb9-d492-497c-9845-5ee0f780db18"
+        },
+        "diagnosis": [
+          {
+            "sequence": 1,
+            "diagnosisCodeableConcept": {
+              "coding": [
+                {
+                  "code": "K77",
+                  "system": "http://hl7.org/fhir/sid/icd-10"
+                }
+              ]
+            }
+          }
+        ],
+        "insurance": [
+          {
+            "focal": true,
+            "coverage": {
+              "reference": "urn:uuid:83992866-8bcd-4748-8925-e0eb40b7951c"
+            },
+            "sequence": 1
+          }
+        ],
+        "resourceType": "Claim",
+        "supportingInfo": [
+          {
+            "category": {
+              "text": "attachment"
+            },
+            "sequence": 1,
+            "valueReference": {
+              "reference": "urn:uuid:6bebc885-70cd-4b58-b0a0-683dff185dc2"
+            }
+          },
+          {
+            "category": {
+              "text": "attachment"
+            },
+            "sequence": 2,
+            "valueReference": {
+              "reference": "urn:uuid:ee0c8b6c-653a-4c88-9eb3-69043e46ca53"
+            }
+          },
+          {
+            "category": {
+              "text": "attachment"
+            },
+            "sequence": 3,
+            "valueReference": {
+              "reference": "urn:uuid:cd8c3ed3-bc0e-4e44-a98f-9d540597c43d"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:e7289d14-318b-4e82-8e45-fedc55c780e5",
+      "resource": {
+        "id": "e7289d14-318b-4e82-8e45-fedc55c780e5",
+        "name": [
+          {
+            "text": "Ramesh Patil"
+          }
+        ],
+        "gender": "male",
+        "birthDate": "1981-04-12",
+        "resourceType": "Patient"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:e78a2bb9-d492-497c-9845-5ee0f780db18",
+      "resource": {
+        "id": "e78a2bb9-d492-497c-9845-5ee0f780db18",
+        "name": "Demo District Hospital",
+        "identifier": [
+          {
+            "value": "HOSP-PUNE-004",
+            "system": "https://facility.abdm.gov.in"
+          }
+        ],
+        "resourceType": "Organization"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:65e402b8-d752-425f-b10d-5c394c19ba87",
+      "resource": {
+        "id": "65e402b8-d752-425f-b10d-5c394c19ba87",
+        "name": "State Health Assurance Society (MJPJAY)",
+        "resourceType": "Organization"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:69770105-32c2-4df5-abc1-778c6db538ec",
+      "resource": {
+        "id": "69770105-32c2-4df5-abc1-778c6db538ec",
+        "name": [
+          {
+            "text": "Dr. A. Kulkarni"
+          }
+        ],
+        "identifier": [
+          {
+            "value": "MH-99123",
+            "system": "https://hpr.abdm.gov.in"
+          }
+        ],
+        "resourceType": "Practitioner"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:83992866-8bcd-4748-8925-e0eb40b7951c",
+      "resource": {
+        "id": "83992866-8bcd-4748-8925-e0eb40b7951c",
+        "payor": [
+          {
+            "reference": "urn:uuid:65e402b8-d752-425f-b10d-5c394c19ba87"
+          }
+        ],
+        "status": "active",
+        "beneficiary": {
+          "reference": "urn:uuid:e7289d14-318b-4e82-8e45-fedc55c780e5"
+        },
+        "resourceType": "Coverage",
+        "subscriberId": "UNKNOWN"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:6bebc885-70cd-4b58-b0a0-683dff185dc2",
+      "resource": {
+        "id": "6bebc885-70cd-4b58-b0a0-683dff185dc2",
+        "type": {
+          "text": "aadhaar_card"
+        },
+        "status": "current",
+        "content": [
+          {
+            "attachment": {
+              "url": "https://example.test/aadhaar.pdf",
+              "title": "aadhaar_card"
+            }
+          }
+        ],
+        "subject": {
+          "reference": "urn:uuid:e7289d14-318b-4e82-8e45-fedc55c780e5"
+        },
+        "resourceType": "DocumentReference"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:ee0c8b6c-653a-4c88-9eb3-69043e46ca53",
+      "resource": {
+        "id": "ee0c8b6c-653a-4c88-9eb3-69043e46ca53",
+        "type": {
+          "text": "clinical_photograph"
+        },
+        "status": "current",
+        "content": [
+          {
+            "attachment": {
+              "url": "https://example.test/clinical_photograph.pdf",
+              "title": "clinical_photograph"
+            }
+          }
+        ],
+        "subject": {
+          "reference": "urn:uuid:e7289d14-318b-4e82-8e45-fedc55c780e5"
+        },
+        "resourceType": "DocumentReference"
+      }
+    },
+    {
+      "fullUrl": "urn:uuid:cd8c3ed3-bc0e-4e44-a98f-9d540597c43d",
+      "resource": {
+        "id": "cd8c3ed3-bc0e-4e44-a98f-9d540597c43d",
+        "type": {
+          "text": "usg"
+        },
+        "status": "current",
+        "content": [
+          {
+            "attachment": {
+              "url": "https://example.test/usg.pdf",
+              "title": "usg"
+            }
+          }
+        ],
+        "subject": {
+          "reference": "urn:uuid:e7289d14-318b-4e82-8e45-fedc55c780e5"
+        },
+        "resourceType": "DocumentReference"
+      }
+    }
+  ],
+  "timestamp": "2026-09-07T17:59:47.652273+00:00",
+  "resourceType": "Bundle"
+}

@@ -146,6 +146,31 @@ class ConfirmCodeRequest(BaseModel):
     confirmed_by: str = "aarogyamitra"
 
 
+# ---------------------------------------------------------------------------
+# 2.6 Admin (Phase 9) — GET /admin/queue, POST /admin/cases/{id}/requeue
+# ---------------------------------------------------------------------------
+
+
+class QueueStatsResponse(BaseModel):
+    """Response for GET /admin/queue — a live snapshot of the Redis Streams
+    work queue and its dead-letter stream, for the ops console."""
+
+    stream_length: int
+    dlq_length: int
+    pending: int
+    groups: list[dict] = Field(default_factory=list)
+    dlq_recent: list[dict] = Field(default_factory=list)
+
+
+class RequeueResponse(BaseModel):
+    """Response for POST /admin/cases/{case_id}/requeue — the on-stage
+    escape hatch for a stuck case. Re-enqueues with trigger='manual_retry'."""
+
+    case_id: str
+    status: CaseStatus
+    job_id: str | None = None
+
+
 class UploadDocumentsRequest(BaseModel):
     """Payload for POST /api/v1/cases/{case_id}/documents."""
 
