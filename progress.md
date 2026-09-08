@@ -402,6 +402,28 @@ of the sync script never double-ingest the same encounter.
   - Added `POST /api/v1/cases/{case_id}/documents` endpoint in `src/mediplug/gateway/main.py` with `UploadDocumentsRequest` in `src/mediplug/schemas.py`.
   - Validated Step 7 & 8 live end-to-end: Ingested case with missing documents -> halted at `action_required` -> uploaded missing files via `/documents` -> worker re-evaluated and flipped status to `ready_for_dispatch`. Tested zero-requirement package drill (sails directly to `ready_for_dispatch`).
   - Full regression test suite: **16/16 passed** (`tests/test_contracts.py`, `tests/test_mapper.py`, `tests/test_normalize.py`, `tests/test_rules.py`).
-- **Phase 7 Readiness Assessment (Next Day 5 Target):**
-  - FHIR Bundle assembly (`src/mediplug/fhir/builder.py`) using `Claim`, `Patient`, `Coverage`, `Condition`, `Binary` resources.
-  - HCX / Payer Dispatch gateway and worker integration.
+- **Phase 7: FHIR R4 Bundle Assembly (COMPLETED & VERIFIED):**
+  - Implemented `src/mediplug/fhir/builder.py` assembling NRCES-compliant FHIR R4 Bundles.
+  - Builds `Claim`, `Patient`, `Coverage`, `Condition` (ICD-10), and `DocumentReference` resources.
+  - Passes all 14 FHIR test cases (`tests/test_fhir.py`).
+
+- **Phase 8: Payer Dispatch & Pipeline Finalization (COMPLETED & VERIFIED):**
+  - Implemented pluggable dispatchers in `src/mediplug/dispatch/`: `MockDispatcher` and `NhcxDispatcher`.
+  - Implemented `src/mediplug/worker/finalize.py` with double-dispatch idempotency guard (`payer_correlation_id`).
+  - Added background adjudication poller in `src/mediplug/worker/adjudication.py`.
+  - Full test suite passes 20/20 tests (`tests/test_dispatch.py`, `tests/test_finalize.py`, `tests/test_adjudication.py`).
+
+- **Phase 9: Resilience & Observability (COMPLETED & VERIFIED):**
+  - Graceful worker shutdown via `src/mediplug/shutdown.py` (finishes in-flight job, flushes Redis, prevents dropped messages).
+  - Poison-pill resilience in `src/mediplug/worker/consumer.py`: unparseable payloads are dead-lettered to DLQ without crashing workers.
+  - Self-reclaim guard tracking `_inflight` message IDs to eliminate worker race conditions.
+  - Admin endpoints in `src/mediplug/gateway/main.py` (`GET /admin/queue`, `POST /admin/cases/{case_id}/requeue`) gated behind `X-Admin-Token`.
+
+- **Phase 10: Demo Driver, Failure Drills & UI Experience (COMPLETED & VERIFIED):**
+  - Automated demo script `scripts/10_demo.py` and runner `scripts/run_demo.sh`.
+  - 8 automated failure drills in `scripts/11_failure_drills.py`.
+  - Aarogyamitra UI updated in `frontend/app/page.tsx` with live queue depth bar (`queue`, `pending`, `dlq`), all 11 status badges, and unmet requirements details.
+
+- **Full Project Status:**
+  - **77/77 Unit & Integration Tests Passing (100%)** across Phases 0 through 10.
+  - Working tree clean, synced with `origin/main` (Commit `0588bd6`).
