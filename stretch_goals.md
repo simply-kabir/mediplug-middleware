@@ -24,8 +24,23 @@
    - **Lifetime Single-Excision Registry:** Organs that can never be excised twice (Gallbladder `S8G5.11`, Appendix `S8G4.1`, Uterus `S4G1.1`, Spleen `S8G12.1`).
    - **Procedure Cooldown Windows:** Mandatory minimum intervals between repeatable procedures (e.g. Cataract surgery on same eye $\ge 3\text{ years}$, Stents $\ge 6\text{ months}$).
    - Short-circuit re-claims to `action_required` with remaining days or prior claim references.
-4. **Validation Suite:**
-   - Isolated unit tests in `tests/test_fraud.py` covering format validation, temporal collision, anatomical impossibility, and cooldown date math.
+4. **Document Integrity & Content-Requirement Matching Layer (Fake / Mismatched Document Prevention):**
+   - **The Problem:** Hospital staff uploading dummy files, blank PDFs, billing receipts, or mismatched scans (e.g. labeling an Aadhaar card or blood report as `biopsy_report` or `usg`) to game automated pre-authorization.
+   - **Layer Architecture:** Positioned in between document ingestion (`POST /cases/{id}/documents` & `POST /preauth`) and the pre-flight rule engine.
+   - **Multi-Level Verification:**
+     - *Level 1 (MIME & Format Gatekeeper):* Validates file extensions, MIME types, and minimum byte sizes (e.g., `clinical_photograph` must be JPG/PNG image, `biopsy_report` must be PDF/DICOM, blocks empty 0-byte dummy uploads).
+     - *Level 2 (Semantic Clinical Content & Marker Classifier):* Lightweight text-inspection / OCR scanning for mandatory clinical vocabulary matching the declared document category:
+       - `usg` (Ultrasound): Requires sonographic markers (*"echogenic"*, *"calculus"*, *"sonography"*, *"acoustic shadow"*, *"gallbladder/appendix visualization"*).
+       - `biopsy_report` (Histopathology): Requires pathology markers (*"histopathology"*, *"microscopic examination"*, *"specimen"*, *"malignancy"*).
+       - `operative_notes`: Requires surgical markers (*"surgeon"*, *"anesthesia"*, *"incision"*, *"operative findings"*).
+       - `aadhaar_card`: Verifies 12-digit UID pattern or Government of India identity markers.
+     - *Level 3 (VLM / Multi-modal Vision Classifier):* Uses lightweight vision models to verify clinical photographs depict actual anatomical surgical sites vs. non-clinical photos, downloaded clipart, or random paperwork.
+   - **Enforcement & UI Alerting:**
+     - Stores `is_verified` (bool) and `rejection_reason` (text) in `case_documents`.
+     - Pre-flight rule engine only considers documents with `is_verified = true` towards satisfying package rules.
+     - Mismatched documents flag `action_required` with specific human alert: e.g. *"Ultrasound (USG) rejected: Document content does not contain required sonographic findings."*
+5. **Validation Suite:**
+   - Isolated unit tests in `tests/test_fraud.py` covering format validation, temporal collision, anatomical impossibility, document content matching, and cooldown date math.
 
 ---
 

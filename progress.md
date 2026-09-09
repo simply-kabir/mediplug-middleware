@@ -36,18 +36,19 @@ Phase 2 — Database schema                    ✅ DONE
 Phase 3 — Ingest gateway                     ✅ DONE
 Phase 4 — Worker skeleton (walking skeleton) ✅ DONE
 Phase 5 — Semantic code mapping              ✅ DONE
-Phase 6 — Pre-flight rule engine             ⏳ NEXT (Day 4 target — the entire project)
-Phase 7 — FHIR R4 bundle builder
-Phase 8 — Dispatch (both NHCX scenarios)
-Phase 9 — Resilience and observability
-Phase 10 — Demo script and failure drills
+Phase 6 — Pre-flight rule engine             ✅ DONE
+Phase 7 — FHIR R4 bundle builder             ✅ DONE
+Phase 8 — Dispatch (both NHCX scenarios)     ✅ DONE
+Phase 9 — Resilience and observability       ✅ DONE
+Phase 10 — Demo script and failure drills    ✅ DONE
 ```
 
 **Milestone status against Master Build Guide (Appendix C):**
 - **Day 1 Exit Criteria MET:** Package master data loaded (1,670 rows, 0.4% unmapped), schema live in Supabase.
 - **Day 2 Exit Criteria MET:** Walking skeleton live — POST → gateway → Redis → worker → Supabase Realtime updates.
 - **Day 3 Exit Criteria MET:** Semantic mapping + abbreviations + vector search + confidence routing (`>=0.82` auto-accept, `0.45-0.82` human review, `<0.45` action required) + `POST /confirm-code` human-in-the-loop endpoint + Next.js Aarogyamitra portal connected to Supabase Realtime.
-- **Day 4 Target (UP NEXT):** Phase 6 — Pre-flight rule engine (`action_required` for missing documents, `POST /cases/{id}/documents` re-enqueue flow).
+- **Day 4 Exit Criteria MET:** Pre-flight rule engine + FHIR R4 Bundle generator + Pluggable Payer Dispatch + Double-dispatch idempotency.
+- **Day 5 Exit Criteria MET:** PR #1 merged (Phases 9 & 10) with graceful shutdown, DLQ poison-pill protection, queue depth metrics, failure drills, and full live E2E adjudication in Aarogyamitra UI. 77/77 tests passing (100%).
 
 ---
 
@@ -426,4 +427,13 @@ of the sync script never double-ingest the same encounter.
 
 - **Full Project Status:**
   - **77/77 Unit & Integration Tests Passing (100%)** across Phases 0 through 10.
-  - Working tree clean, synced with `origin/main` (Commit `0588bd6`).
+  - Working tree clean, synced with `origin/main` (Commit `142cbee`).
+
+### Session update — 2026-09-08 (Live E2E Verification & Adjudication Drill)
+- **Live Pipeline Manual Validation:**
+  - Ingested low-confidence test case (`Kabir Sharma`, `9112ff60-c429-4db3-a890-39efba5d5dcc`). Verified automatic routing to `action_required`.
+  - Confirmed human code selection (`S8G5.11`) via Aarogyamitra UI modal and `POST /confirm-code`.
+  - Pre-flight rule engine intercepted case, detected missing MJPJAY mandatory files (`clinical_photograph`, `usg`), and rendered unmet requirements banner in the portal.
+  - Uploaded missing documents via `POST /api/v1/cases/{case_id}/documents`. Worker re-evaluated, generated FHIR R4 claim bundle, and dispatched to Mock Payer (`submitted`).
+  - Executed mock payer adjudication drill via `POST http://localhost:8081/adjudicate/{correlation_id}` (`approved`).
+  - Verified background poller (`python -m mediplug.worker.adjudication`) synchronizes adjudication decisions and transitions case to `payer_approved` in Supabase Realtime.
