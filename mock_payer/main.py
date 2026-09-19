@@ -110,3 +110,11 @@ async def received() -> dict:
         cid: {"flow": r["flow"], "code": r["code"], "outcome": r["outcome"]}
         for cid, r in RECEIVED.items()
     }
+
+
+@app.post("/clear")
+@app.delete("/received")
+async def clear_received() -> dict:
+    RECEIVED.clear()
+    return {"status": "ok", "received": len(RECEIVED)}
+

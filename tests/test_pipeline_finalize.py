@@ -39,7 +39,17 @@ def wired(monkeypatch):
     monkeypatch.setattr(pipeline, "_read_case_state", lambda cid: state["case_state"])
     monkeypatch.setattr(pipeline, "map_notes", lambda notes, k: state["candidates"])
     monkeypatch.setattr(
-        pipeline, "_check_rules_for_code", lambda cid, stage, code: state["rules"]
+        pipeline,
+        "_check_integrity_and_rules",
+        lambda cid, stage, code, pat, enc: (
+            pipeline.IntegrityCheckResult(passed=True),
+            state["rules"],
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_check_collision_db",
+        lambda cid, pat, enc: (True, None),
     )
 
     async def _finalize(case_id):

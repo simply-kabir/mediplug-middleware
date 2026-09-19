@@ -40,7 +40,7 @@ class CaseStatus(StrEnum):
 CASE_STATUSES: list[str] = [s.value for s in CaseStatus]
 
 Stage = Literal["preauth", "claim"]
-Trigger = Literal["ingest", "docs_updated", "code_confirmed", "manual_retry"]
+Trigger = Literal["ingest", "docs_updated", "code_confirmed", "manual_retry", "manual_dispatch"]
 
 
 # ---------------------------------------------------------------------------

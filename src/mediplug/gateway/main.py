@@ -29,14 +29,27 @@ import secrets
 import uuid
 from contextlib import asynccontextmanager
 
+from pathlib import Path
+
 import psycopg
 import structlog
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Request,
+    UploadFile,
+)
+from fastapi.staticfiles import StaticFiles
 from psycopg.types.json import Json
 from psycopg_pool import AsyncConnectionPool
 from redis.exceptions import RedisError
 
 from ..config import settings
+from ..fraud import validate_abha
 from ..logging import configure
 from ..queue import close_redis, enqueue, ensure_group, queue_stats
 from ..schemas import (
@@ -65,7 +78,16 @@ db_pool = AsyncConnectionPool(
     settings.database_url,
     min_size=2,
     max_size=8,
-    kwargs={"prepare_threshold": None},
+    check=AsyncConnectionPool.check_connection,
+    max_idle=45.0,
+    max_lifetime=300.0,
+    kwargs={
+        "prepare_threshold": None,
+        "keepalives": 1,
+        "keepalives_idle": 30,
+        "keepalives_interval": 10,
+        "keepalives_count": 3,
+    },
     open=False,
 )
 
@@ -93,6 +115,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+UPLOAD_DIR = Path(__file__).resolve().parents[3] / "data" / "uploads"
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
 
 
 def _new_tracking_ref() -> str:
@@ -155,6 +181,13 @@ async def ingest(
 ) -> IngestResponse:
     if not idempotency_key.strip():
         raise HTTPException(400, "Idempotency-Key header must not be blank")
+
+    # Anti-Fraud Pillar 1: Validate ABHA format, dummy patterns & Verhoeff checksum
+    if body.patient.abha_number:
+        is_valid, err_msg = validate_abha(body.patient.abha_number)
+        if not is_valid:
+            log.warning("anti_fraud_abha_rejected", abha=body.patient.abha_number, error=err_msg)
+            raise HTTPException(400, f"Anti-Fraud Gatekeeper: {err_msg}")
 
     try:
         async with db_pool.connection() as conn:
@@ -483,6 +516,426 @@ async def upload_documents(
         "tracking_ref": tracking_ref,
         "status": CaseStatus.QUEUED.value,
         "documents_added": len(body.documents),
+        "job_id": job_id,
+    }
+
+
+@app.post("/api/v1/cases/{case_id}/upload-document", status_code=200)
+async def upload_case_file(
+    request: Request,
+    case_id: uuid.UUID,
+    file: UploadFile = File(...),
+    document_type: str = Form(...),
+    uploaded_by: str = Form("aarogyamitra"),
+    re_enqueue: bool = Form(True),
+) -> dict:
+    """Upload a real binary document (PDF/image) to a case and optionally re-enqueue for pre-flight rule evaluation."""
+    case_str = str(case_id)
+    doc_type = document_type.strip()
+    if not doc_type:
+        raise HTTPException(400, "document_type is required")
+    if not file.filename:
+        raise HTTPException(400, "Valid file must be provided")
+
+    case_upload_dir = UPLOAD_DIR / case_str
+    case_upload_dir.mkdir(parents=True, exist_ok=True)
+
+    safe_filename = Path(file.filename).name
+    file_path = case_upload_dir / safe_filename
+
+    contents = await file.read()
+    with open(file_path, "wb") as f:
+        f.write(contents)
+
+    base = str(request.base_url).rstrip("/")
+    file_url = f"{base}/uploads/{case_str}/{safe_filename}"
+
+    try:
+        async with db_pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "select status, stage, tracking_ref from cases where id = %s",
+                    (case_str,),
+                )
+                case_row = await cur.fetchone()
+                if not case_row:
+                    raise HTTPException(404, "Case not found")
+                prev_status, stage, tracking_ref = case_row
+
+                await cur.execute(
+                    """
+                    insert into case_documents (case_id, document_type, file_url, file_name)
+                    values (%s, %s, %s, %s)
+                    """,
+                    (case_str, doc_type, file_url, safe_filename),
+                )
+
+                if re_enqueue:
+                    await cur.execute(
+                        "update cases set status = %s where id = %s",
+                        (CaseStatus.QUEUED.value, case_str),
+                    )
+
+                await cur.execute(
+                    """
+                    insert into case_events
+                        (case_id, from_status, to_status, actor, detail)
+                    values (%s, %s, %s, %s, %s)
+                    """,
+                    (
+                        case_str,
+                        prev_status,
+                        CaseStatus.QUEUED.value if re_enqueue else prev_status,
+                        uploaded_by,
+                        Json(
+                            {
+                                "uploaded_documents": [
+                                    {
+                                        "document_type": doc_type,
+                                        "file_url": file_url,
+                                        "file_name": safe_filename,
+                                        "file_size": len(contents),
+                                    }
+                                ],
+                                "uploaded_by": uploaded_by,
+                                "re_enqueue": re_enqueue,
+                            }
+                        ),
+                    ),
+                )
+            await conn.commit()
+    except HTTPException:
+        raise
+    except psycopg.Error as exc:
+        log.error("db_error_on_upload_case_file", case_id=case_str, error=str(exc))
+        raise HTTPException(500, "Database error during document upload") from exc
+
+    job_id = None
+    if re_enqueue:
+        envelope = JobEnvelope(case_id=case_str, stage=stage, trigger="docs_updated")
+        try:
+            job_id = await enqueue(envelope)
+        except Exception as exc:
+            log.error("redis_enqueue_failed_on_upload_case_file", case_id=case_str, error=str(exc))
+            raise HTTPException(
+                503, "Queue unavailable — document saved, retry to re-enqueue"
+            ) from exc
+
+    log.info(
+        "document_file_uploaded",
+        case_id=case_str,
+        document_type=doc_type,
+        file_name=safe_filename,
+        file_url=file_url,
+        job_id=job_id,
+        re_enqueued=re_enqueue,
+    )
+
+    return {
+        "case_id": case_str,
+        "tracking_ref": tracking_ref,
+        "status": CaseStatus.QUEUED.value if re_enqueue else prev_status,
+        "document": {
+            "document_type": doc_type,
+            "file_name": safe_filename,
+            "file_url": file_url,
+        },
+        "job_id": job_id,
+    }
+
+
+@app.post("/api/v1/cases/{case_id}/upload-documents-batch", status_code=200)
+async def upload_documents_batch(
+    request: Request,
+    case_id: uuid.UUID,
+    files: list[UploadFile] = File(...),
+    document_types: list[str] = Form(...),
+    uploaded_by: str = Form("claim_officer"),
+) -> dict:
+    """Upload multiple documents at once in a single batch, and only trigger rule re-evaluation ONCE."""
+    case_str = str(case_id)
+    if not files:
+        raise HTTPException(400, "At least one file must be provided")
+
+    case_upload_dir = UPLOAD_DIR / case_str
+    case_upload_dir.mkdir(parents=True, exist_ok=True)
+    base = str(request.base_url).rstrip("/")
+
+    try:
+        async with db_pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "select status, stage, tracking_ref from cases where id = %s",
+                    (case_str,),
+                )
+                case_row = await cur.fetchone()
+                if not case_row:
+                    raise HTTPException(404, "Case not found")
+                prev_status, stage, tracking_ref = case_row
+
+                uploaded_docs = []
+                for idx, file in enumerate(files):
+                    safe_filename = Path(file.filename).name if file.filename else f"doc_{idx}_{uuid.uuid4().hex[:6]}.pdf"
+                    file_path = case_upload_dir / safe_filename
+                    contents = await file.read()
+                    with open(file_path, "wb") as f:
+                        f.write(contents)
+
+                    doc_type = (document_types[idx] if idx < len(document_types) else document_types[-1]).strip()
+                    file_url = f"{base}/uploads/{case_str}/{safe_filename}"
+
+                    await cur.execute(
+                        """
+                        insert into case_documents (case_id, document_type, file_url, file_name)
+                        values (%s, %s, %s, %s)
+                        """,
+                        (case_str, doc_type, file_url, safe_filename),
+                    )
+                    uploaded_docs.append({
+                        "document_type": doc_type,
+                        "file_name": safe_filename,
+                        "file_url": file_url,
+                        "file_size": len(contents),
+                    })
+
+                # Transition to queued for re-evaluation once
+                await cur.execute(
+                    "update cases set status = %s where id = %s",
+                    (CaseStatus.QUEUED.value, case_str),
+                )
+
+                await cur.execute(
+                    """
+                    insert into case_events
+                        (case_id, from_status, to_status, actor, detail)
+                    values (%s, %s, %s, %s, %s)
+                    """,
+                    (
+                        case_str,
+                        prev_status,
+                        CaseStatus.QUEUED.value,
+                        uploaded_by,
+                        Json({
+                            "uploaded_documents": uploaded_docs,
+                            "uploaded_by": uploaded_by,
+                            "batch": True,
+                        }),
+                    ),
+                )
+            await conn.commit()
+    except HTTPException:
+        raise
+    except psycopg.Error as exc:
+        log.error("db_error_on_batch_upload", case_id=case_str, error=str(exc))
+        raise HTTPException(500, "Database error during batch document upload") from exc
+
+    envelope = JobEnvelope(case_id=case_str, stage=stage, trigger="docs_updated")
+    try:
+        job_id = await enqueue(envelope)
+    except Exception as exc:
+        log.error("redis_enqueue_failed_on_batch_upload", case_id=case_str, error=str(exc))
+        raise HTTPException(
+            503, "Queue unavailable — documents saved, retry to re-enqueue"
+        ) from exc
+
+    log.info("documents_batch_uploaded", case_id=case_str, count=len(uploaded_docs), job_id=job_id)
+    return {
+        "case_id": case_str,
+        "tracking_ref": tracking_ref,
+        "status": CaseStatus.QUEUED.value,
+        "documents_added": len(uploaded_docs),
+        "documents": uploaded_docs,
+        "job_id": job_id,
+    }
+
+
+@app.get("/api/v1/cases/{case_id}/documents", status_code=200)
+async def list_case_documents(case_id: uuid.UUID) -> list[dict]:
+    """List all documents attached to a case."""
+    case_str = str(case_id)
+    try:
+        async with db_pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    select id, document_type, file_url, file_name, uploaded_at
+                    from case_documents
+                    where case_id = %s
+                    order by uploaded_at asc
+                    """,
+                    (case_str,),
+                )
+                rows = await cur.fetchall()
+                return [
+                    {
+                        "id": str(r[0]),
+                        "document_type": r[1],
+                        "file_url": r[2],
+                        "file_name": r[3],
+                        "uploaded_at": r[4].isoformat() if r[4] else None,
+                    }
+                    for r in rows
+                ]
+    except psycopg.Error as exc:
+        log.error("db_error_on_list_case_documents", case_id=case_str, error=str(exc))
+        raise HTTPException(500, "Database error listing documents") from exc
+
+
+@app.get("/api/v1/cases/{case_id}", status_code=200)
+async def get_case(case_id: str) -> dict:
+    """Retrieve full case details by UUID, tracking_ref, or hms_case_ref."""
+    for attempt in range(2):
+        try:
+            async with db_pool.connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        select id, tracking_ref, hms_case_ref, stage, status,
+                               patient, encounter, raw_clinical_notes,
+                               missing_requirements, mapped_package_code, mapped_package_name,
+                               confidence, alternate_codes, payer_correlation_id, error_message,
+                               created_at
+                        from cases
+                        where id::text = %s or tracking_ref = %s or hms_case_ref = %s
+                        order by created_at desc
+                        limit 1
+                        """,
+                        (case_id, case_id, case_id),
+                    )
+                    row = await cur.fetchone()
+                    if not row:
+                        raise HTTPException(404, "Case not found")
+
+                    (
+                        c_id, tracking_ref, hms_case_ref, stage, status,
+                        patient, encounter, notes,
+                        missing_reqs, pkg_code, pkg_name,
+                        confidence, alt_codes, corr_id, err_msg,
+                        created_at
+                    ) = row
+
+                    await cur.execute(
+                        """
+                        select id, document_type, file_url, file_name, uploaded_at
+                        from case_documents
+                        where case_id = %s
+                        order by uploaded_at asc
+                        """,
+                        (c_id,),
+                    )
+                    doc_rows = await cur.fetchall()
+                    documents = [
+                        {
+                            "id": str(r[0]),
+                            "document_type": r[1],
+                            "file_url": r[2],
+                            "file_name": r[3],
+                            "uploaded_at": r[4].isoformat() if r[4] else None,
+                        }
+                        for r in doc_rows
+                    ]
+
+                    return {
+                        "id": str(c_id),
+                        "tracking_ref": tracking_ref,
+                        "hms_case_ref": hms_case_ref,
+                        "stage": stage,
+                        "status": status,
+                        "patient": patient or {},
+                        "encounter": encounter or {},
+                        "raw_clinical_notes": notes or "",
+                        "missing_requirements": missing_reqs or [],
+                        "mapped_package_code": pkg_code,
+                        "mapped_package_name": pkg_name,
+                        "confidence": confidence,
+                        "alternate_codes": alt_codes or [],
+                        "payer_correlation_id": corr_id,
+                        "error_message": err_msg,
+                        "created_at": created_at.isoformat() if created_at else None,
+                        "documents": documents,
+                    }
+        except HTTPException:
+            raise
+        except psycopg.Error as exc:
+            if attempt == 0:
+                log.warning("db_retry_on_get_case", case_id=case_id, error=str(exc))
+                await asyncio.sleep(0.1)
+                continue
+            log.error("db_error_on_get_case", case_id=case_id, error=str(exc))
+            raise HTTPException(500, "Database error retrieving case") from exc
+
+
+@app.post("/api/v1/cases/{case_id}/manual-dispatch", status_code=200)
+async def manual_dispatch(case_id: str, dispatched_by: str = Form("claim_officer")) -> dict:
+    """Manually dispatch a case. Re-evaluates rules and dispatches to payer (NHCX).
+    Designed for when automatic dispatch failed or worker was shut down and restarted."""
+    try:
+        async with db_pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    select id, status, stage, tracking_ref, mapped_package_code
+                    from cases
+                    where id::text = %s or tracking_ref = %s or hms_case_ref = %s
+                    limit 1
+                    """,
+                    (case_id, case_id, case_id),
+                )
+                case_row = await cur.fetchone()
+                if not case_row:
+                    raise HTTPException(404, "Case not found")
+
+                c_id, prev_status, stage, tracking_ref, pkg_code = case_row
+                case_str = str(c_id)
+
+                if not pkg_code:
+                    raise HTTPException(
+                        400,
+                        "Cannot dispatch case without confirmed package code. Please select and confirm a package code first.",
+                    )
+
+                # Set status to queued so worker evaluates pre-flight rules and dispatches
+                await cur.execute(
+                    "update cases set status = %s where id = %s",
+                    (CaseStatus.QUEUED.value, case_str),
+                )
+
+                await cur.execute(
+                    """
+                    insert into case_events
+                        (case_id, from_status, to_status, actor, detail)
+                    values (%s, %s, %s, %s, %s)
+                    """,
+                    (
+                        case_str,
+                        prev_status,
+                        CaseStatus.QUEUED.value,
+                        dispatched_by,
+                        Json({"trigger": "manual_dispatch", "action": "manual_dispatch_initiated"}),
+                    ),
+                )
+            await conn.commit()
+    except HTTPException:
+        raise
+    except psycopg.Error as exc:
+        log.error("db_error_on_manual_dispatch", case_id=case_id, error=str(exc))
+        raise HTTPException(500, "Database error initiating manual dispatch") from exc
+
+    envelope = JobEnvelope(case_id=case_str, stage=stage, trigger="manual_dispatch")
+    try:
+        job_id = await enqueue(envelope)
+    except Exception as exc:
+        log.error("redis_enqueue_failed_on_manual_dispatch", case_id=case_str, error=str(exc))
+        raise HTTPException(
+            503, "Queue unavailable — case queued in DB, retry or start worker"
+        ) from exc
+
+    log.info("manual_dispatch_queued", case_id=case_str, job_id=job_id)
+    return {
+        "case_id": case_str,
+        "tracking_ref": tracking_ref,
+        "status": CaseStatus.QUEUED.value,
+        "message": "Manual dispatch queued. Worker will evaluate pre-flight rules and dispatch to payer.",
         "job_id": job_id,
     }
 

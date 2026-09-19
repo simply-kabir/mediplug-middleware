@@ -30,6 +30,11 @@ from psycopg.types.json import Json
 import structlog
 
 from ..config import settings
+from ..fraud import (
+    IntegrityCheckResult,
+    check_concurrent_admission,
+    evaluate_clinical_integrity,
+)
 from ..mapping.mapper import map_notes
 from ..rules.engine import evaluate, RuleEvaluation
 from ..schemas import CodeCandidate
@@ -88,17 +93,84 @@ def _check_rules_for_code(case_id: str, stage: str, package_code: str) -> RuleEv
     return evaluate(stage_requirements, uploaded_doc_types)
 
 
-def _read_case_state(case_id: str) -> tuple[str, str | None, object] | None:
+def _check_integrity_and_rules(
+    case_id: str,
+    stage: str,
+    package_code: str,
+    patient: dict,
+    encounter: dict,
+) -> tuple[IntegrityCheckResult, RuleEvaluation]:
+    """Check clinical integrity / anti-fraud rules first, then pre-flight document rules.
+    Synchronous/blocking — callers MUST wrap this in asyncio.to_thread()."""
+    with psycopg.connect(settings.database_url) as conn, conn.cursor() as cur:
+        # 1. Anti-fraud & clinical integrity check
+        integrity_res = evaluate_clinical_integrity(
+            cur, case_id, patient, encounter, package_code
+        )
+        if not integrity_res.passed:
+            cur.execute(
+                """
+                INSERT INTO case_events (case_id, from_status, to_status, actor, detail)
+                VALUES (%s, 'analyzing', 'action_required', 'anti_fraud_engine', %s)
+                """,
+                (case_id, Json(integrity_res.detail or {})),
+            )
+            conn.commit()
+            dummy_rule = RuleEvaluation(
+                passed=False,
+                missing_requirements=[
+                    {
+                        "human_label": f"FRAUD ALERT: {integrity_res.message}",
+                        "satisfied": False,
+                        "violation_type": integrity_res.violation_type,
+                    }
+                ],
+            )
+            return integrity_res, dummy_rule
+
+        # 2. Pre-flight document check
+        cur.execute("SELECT requirements FROM packages WHERE code = %s", (package_code,))
+        pkg_row = cur.fetchone()
+        stage_requirements = (pkg_row[0] or {}).get(stage, []) if pkg_row else []
+
+        cur.execute("SELECT document_type FROM case_documents WHERE case_id = %s", (case_id,))
+        doc_rows = cur.fetchall()
+        uploaded_doc_types = [r[0] for r in doc_rows]
+
+    rule_res = evaluate(stage_requirements, uploaded_doc_types)
+    return integrity_res, rule_res
+
+
+def _read_case_state(
+    case_id: str,
+) -> tuple[str, str | None, object, dict, dict] | None:
     """Fetch the fields process_case needs fresh from the DB. Synchronous/
     blocking — callers MUST wrap this in asyncio.to_thread(). Returns None
     if the case doesn't exist."""
     with psycopg.connect(settings.database_url) as conn, conn.cursor() as cur:
         cur.execute(
-            """SELECT raw_clinical_notes, mapped_package_code, code_confirmed_at
+            """SELECT raw_clinical_notes, mapped_package_code, code_confirmed_at, patient, encounter
                FROM cases WHERE id = %s""",
             (case_id,),
         )
         return cur.fetchone()
+
+
+def _check_collision_db(cid: str, pat: dict, enc: dict) -> tuple[bool, dict | None]:
+    if not pat and not enc:
+        return True, None
+    with psycopg.connect(settings.database_url) as conn, conn.cursor() as cur:
+        passed, detail = check_concurrent_admission(cur, cid, pat, enc)
+        if not passed and detail:
+            cur.execute(
+                """
+                INSERT INTO case_events (case_id, from_status, to_status, actor, detail)
+                VALUES (%s, 'analyzing', 'action_required', 'anti_fraud_engine', %s)
+                """,
+                (cid, Json(detail)),
+            )
+            conn.commit()
+        return passed, detail
 
 
 async def process_case(job: dict) -> None:
@@ -123,14 +195,50 @@ async def process_case(job: dict) -> None:
         if not row:
             log.error("case_not_found", case_id=case_id)
             return
-        notes, existing_code, confirmed_at = row
+        if len(row) == 5:
+            notes, existing_code, confirmed_at, patient, encounter = row
+        else:
+            notes, existing_code, confirmed_at = row[:3]
+            patient, encounter = {}, {}
 
-        # 3. Check if trigger is code_confirmed or docs_updated (skip mapping, evaluate rules)
-        if trigger in ("code_confirmed", "docs_updated") and existing_code:
-            log.info("skipping_mapping_running_rules", trigger=trigger, code=existing_code)
-            rule_res = await asyncio.to_thread(
-                _check_rules_for_code, case_id, stage, existing_code
+        collision_pass, collision_detail = await asyncio.to_thread(
+            _check_collision_db, case_id, patient, encounter
+        )
+        if not collision_pass and collision_detail:
+            log.warning("ghost_admission_collision_detected", case_id=case_id, detail=collision_detail)
+            fraud_missing = [
+                {
+                    "human_label": f"FRAUD ALERT: {collision_detail['message']}",
+                    "satisfied": False,
+                    "violation_type": collision_detail.get("violation_type", "concurrent_admission_collision"),
+                }
+            ]
+            await asyncio.to_thread(
+                _set_status,
+                case_id,
+                "action_required",
+                missing_requirements=Json(fraud_missing),
             )
+            log.info("processing_case_done", final_status="action_required")
+            return
+
+        # 3. Check if trigger is code_confirmed, docs_updated, or manual_dispatch (skip mapping, evaluate integrity & rules)
+        if trigger in ("code_confirmed", "docs_updated", "manual_dispatch", "manual_retry") and existing_code:
+            log.info("skipping_mapping_running_rules", trigger=trigger, code=existing_code)
+            integrity_res, rule_res = await asyncio.to_thread(
+                _check_integrity_and_rules, case_id, stage, existing_code, patient, encounter
+            )
+            if not integrity_res.passed:
+                log.warning("anti_fraud_violation_blocked", case_id=case_id, violation=integrity_res.violation_type)
+                await asyncio.to_thread(
+                    _set_status,
+                    case_id,
+                    "action_required",
+                    missing_requirements=Json(rule_res.missing_requirements),
+                )
+                log.info("processing_case_done", final_status="action_required")
+                return
+
             if rule_res.passed:
                 await asyncio.to_thread(
                     _set_status, case_id, "ready_for_dispatch", missing_requirements=Json([])
@@ -169,16 +277,33 @@ async def process_case(job: dict) -> None:
         best = candidates[0]
         alternate_json = Json([c.model_dump() for c in candidates])
 
-        # 5. Confidence routing + Pre-flight rules
+        # 5. Confidence routing + Anti-fraud & Pre-flight rules
         if best.confidence >= settings.confidence_auto_accept:
-            # High confidence (>= 0.82): Auto-accept code, then check pre-flight document rules
+            # High confidence (>= 0.82): Auto-accept code, then check integrity and rules
             log.info(
                 "auto_accept_package",
                 code=best.code,
                 name=best.name,
                 confidence=best.confidence,
             )
-            rule_res = await asyncio.to_thread(_check_rules_for_code, case_id, stage, best.code)
+            integrity_res, rule_res = await asyncio.to_thread(
+                _check_integrity_and_rules, case_id, stage, best.code, patient, encounter
+            )
+            if not integrity_res.passed:
+                log.warning("anti_fraud_violation_blocked", case_id=case_id, violation=integrity_res.violation_type)
+                await asyncio.to_thread(
+                    _set_status,
+                    case_id,
+                    "action_required",
+                    mapped_package_code=best.code,
+                    mapped_package_name=best.name,
+                    confidence=best.confidence,
+                    alternate_codes=alternate_json,
+                    missing_requirements=Json(rule_res.missing_requirements),
+                )
+                log.info("processing_case_done", final_status="action_required")
+                return
+
             target_status = "ready_for_dispatch" if rule_res.passed else "action_required"
             await asyncio.to_thread(
                 _set_status,

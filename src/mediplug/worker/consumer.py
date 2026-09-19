@@ -32,6 +32,7 @@ import socket
 
 import structlog
 from redis.asyncio import Redis
+from redis.exceptions import ConnectionError as RedisConnectionError, RedisError, TimeoutError as RedisTimeoutError
 
 from ..config import settings
 from ..queue import close_redis, ensure_group, get_redis
@@ -182,13 +183,24 @@ async def run() -> None:
 
     try:
         while not shutdown_event.is_set():
-            resp = await r.xreadgroup(
-                settings.consumer_group,
-                CONSUMER_NAME,
-                {settings.stream_key: ">"},  # ">" = new messages only
-                count=1,
-                block=5000,  # block up to 5s, then loop (keeps the process responsive)
-            )
+            try:
+                resp = await r.xreadgroup(
+                    settings.consumer_group,
+                    CONSUMER_NAME,
+                    {settings.stream_key: ">"},  # ">" = new messages only
+                    count=1,
+                    block=5000,  # block up to 5s, then loop (keeps the process responsive)
+                )
+            except (RedisTimeoutError, TimeoutError):
+                # Idle stream read timeout (5s block elapsed with no new items) — continue polling
+                continue
+            except (RedisConnectionError, RedisError) as exc:
+                if shutdown_event.is_set():
+                    break
+                log.warning("redis_stream_read_error", error=str(exc))
+                await asyncio.sleep(1.0)
+                continue
+
             if not resp:
                 continue
             for _stream, messages in resp:

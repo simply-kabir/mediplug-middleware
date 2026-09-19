@@ -437,3 +437,33 @@ of the sync script never double-ingest the same encounter.
   - Uploaded missing documents via `POST /api/v1/cases/{case_id}/documents`. Worker re-evaluated, generated FHIR R4 claim bundle, and dispatched to Mock Payer (`submitted`).
   - Executed mock payer adjudication drill via `POST http://localhost:8081/adjudicate/{correlation_id}` (`approved`).
   - Verified background poller (`python -m mediplug.worker.adjudication`) synchronizes adjudication decisions and transitions case to `payer_approved` in Supabase Realtime.
+
+### Session update — 2026-09-09 (Interactive UI File Upload & End-to-End Verification)
+- **Interactive File Upload Engine (Backend + Frontend):**
+  - Added `POST /api/v1/cases/{case_id}/upload-document` in `src/mediplug/gateway/main.py`: multipart form upload supporting real PDF/image files, path sanitization, disk storage under `data/uploads/{case_id}/`, and static route mounting at `/uploads`.
+  - Added `GET /api/v1/cases/{case_id}/documents` endpoint in gateway returning all attached documents with file URLs.
+  - Added `tests/test_upload.py` unit testing multipart validation, disk storage, and document listing.
+  - Replaced static placeholder upload button in `frontend/app/page.tsx` with a fully interactive file dropzone supporting drag-and-drop, native file picker, file size/name preview, and missing requirement selector.
+  - Connected upload form to the gateway: uploads file, displays live loading spinner, renders success banner, and displays "Attached Case Documents" list with direct browser view links.
+  - Enhanced modal status presentation to render detailed error messages on `dispatch_failed` (e.g. missing ICD codes), correlation IDs on `submitted`, and approval badges on `payer_approved`.
+- **Live Verification & Full Test Pass:**
+  - Verified live pipeline with case `Kavita Rao` (`MP-983D008974`): halted at `action_required` (missing USG) -> operator uploaded `favicon.png` as `usg` directly in Aarogyamitra UI -> worker re-evaluated rules -> auto-advanced to `ready_for_dispatch` -> assembled FHIR R4 Bundle -> dispatched to Mock Payer (`submitted`, `correlation_id: 359c9700-74da-4fe2-a741-4e6b3be5a4a1`) -> adjudicated to `approved` -> synced via `poll_once()` to `payer_approved`.
+  - **80/80 pytest tests passing (100%)** in 32.49s.
+  - **27/28 (96.4%) accuracy** on clinical evaluation benchmarks (`07_mapping_eval.py`) with 0 dangerous wrong auto-accepts.
+  - `npm run build` cleanly compiled production Next.js frontend with 0 TypeScript/ESLint errors.
+
+### Session update — 2026-09-09 (Goal 0: Anti-Fraud & Clinical Integrity Engine — Pillars 1, 2, & 3)
+- **Goal 0 Scope & Architectural Decisions:**
+  - Implemented the first three pillars of the Anti-Fraud and Clinical Integrity Engine (Goal 0 from `stretch_goals.md`), while explicitly keeping Pillar 4 (Document Content / Vision OCR) on hold as instructed.
+  - Created isolated module directory `src/mediplug/fraud/`:
+    - `abha.py`: Verhoeff checksum algorithm (D, P, Inv tables), repetitive dummy patterns checker (`00-0000-0000-0000`, `11111111111111`, sequential patterns), and ABDM ABHA/PHR format validation.
+    - `collision.py`: Concurrent Inpatient Admission Checker (`check_concurrent_admission`). Detects ghost hospital collisions (active, un-discharged admissions for the same patient across different hospitals) matching by ABHA or Name + DOB.
+    - `restrictions.py`: Lifetime Single-Excision Organ Registry (Gallbladder, Appendix, Uterus, Spleen) and Procedure Cooldown Registry (Cataract: 3 years, CABG: 180 days, Pacemaker: 180 days). Inspects prior approved/submitted claims.
+    - `engine.py`: Unified `evaluate_clinical_integrity(cur, case_id, patient, encounter, package_code)`.
+- **Pipeline & Ingest Gatekeeper Integration:**
+  - `POST /api/v1/cases/ingest` in `src/mediplug/gateway/main.py`: Rejects invalid ABHA numbers (dummy patterns or failed Verhoeff checksum) with fast HTTP 400 Bad Request before database insertion.
+  - Worker Pipeline in `src/mediplug/worker/pipeline.py`: Added `_check_integrity_and_rules()`. Evaluated both on auto-accept mapping and human code confirmation. On fraud detection, logs audit event to `case_events` with `actor='anti_fraud_engine'` and halts case at `action_required` with high-visibility `FRAUD ALERT:` in `missing_requirements`, rendering cleanly in the Aarogyamitra UI without breaking database schemas.
+- **Comprehensive Verification & Regression Suite:**
+  - Created `tests/test_fraud.py` covering Verhoeff computation, corrupted check digits, dummy sequences, ghost admission collisions, repeat cholecystectomy/appendectomy, CABG cooldown windows, and gateway ingest gatekeeper rejections.
+  - **96/96 pytest tests passing (100%)** across all 14 test suites.
+  - `npm run build` passing with 0 errors.

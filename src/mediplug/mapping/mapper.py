@@ -43,7 +43,7 @@ def _model():
 
 
 def _corpus_texts() -> tuple[str, ...]:
-    return tuple(row.search_text for row in load_corpus())
+    return tuple(row.search_text.lower() for row in load_corpus())
 
 
 def map_notes(notes: str, top_k: int = 3) -> list[CodeCandidate]:
@@ -71,12 +71,13 @@ def map_notes(notes: str, top_k: int = 3) -> list[CodeCandidate]:
     q_emb = _model().encode([query], normalize_embeddings=True)[0]
     sims = embeddings[idxs] @ q_emb
 
+    # Calibrate cosine similarities: MiniLM cosine similarities against short titles
+    # range from ~0.15 (unrelated) to ~0.60 (strong match).
+    sim_norm = np.clip((sims - 0.15) / 0.45, 0.0, 1.0)
+
     # Blend semantic + lexical for EVERY shortlisted candidate first —
-    # selecting top_k by sims alone would drop a candidate that has a
-    # strong lexical hit but only a middling semantic score, exactly
-    # the case this blend exists to catch (see module docstring).
     lexical_scores = np.array([prefilter[i][1] / 100.0 for i in range(len(idxs))])
-    blended = 0.7 * sims + 0.3 * lexical_scores
+    blended = 0.6 * sim_norm + 0.4 * lexical_scores
 
     order = np.argsort(-blended)[:top_k]
     out: list[CodeCandidate] = []
